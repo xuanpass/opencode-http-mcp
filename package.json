@@ -1,28 +1,31 @@
 {
   "name": "opencode-http-mcp",
-  "version": "1.0.0",
-  "description": "Zero-dependency, pure-JavaScript stdio MCP bridge for OpenCode 2.x/3.x servers. Talks directly to the official /api/... HTTP endpoints — no OpenCode client SDK, no build step.",
+  "version": "3.0.0",
+  "description": "Zero-dependency, pure-JavaScript stdio MCP bridge for OpenCode 2.x/3.x servers. Full parity with opencode-mcp 3.x tooling — talks directly to the official /api/... HTTP endpoints with honest no-route fallbacks, no OpenCode client SDK, no build step.",
   "keywords": [
     "mcp",
     "model-context-protocol",
     "opencode",
     "bridge",
-    "zero-dependency"
+    "zero-dependency",
+    "http"
   ],
   "license": "MIT",
   "type": "commonjs",
-  "main": "index.js",
+  "main": "src/index.js",
   "bin": {
-    "opencode-http-mcp": "index.js"
+    "opencode-http-mcp": "src/index.js"
   },
   "files": [
+    "src/",
     "index.js"
   ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node index.js",
-    "test": "node test.js"
+    "start": "node src/index.js",
+    "test": "node test.js",
+    "smoke-test": "node test.js"
   }
 }

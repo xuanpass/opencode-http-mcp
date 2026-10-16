@@ -1,29 +1,67 @@
 # opencode-http-mcp
 
 A **zero-dependency, pure-JavaScript** stdio MCP server that bridges MCP
-clients (Claude Desktop, WorkBuddy, Cursor, any JSON-RPC stdio client) to an
+clients (WorkBuddy, Claude Desktop, Cursor, any JSON-RPC stdio client) to an
 OpenCode 2.x / 3.x server.
 
 It talks **directly** to OpenCode's official `/api/...` HTTP endpoints and
 hand-rolls the MCP stdio (JSON-RPC) protocol on top of `node:readline`.
-No `@modelcontextprotocol/sdk`, no `zod`, no build step — just one JS file.
+No `@modelcontextprotocol/sdk`, no `zod`, no build step — just Node standard
+library.
 
 ## Why this exists
 
-The community `opencode-mcp` package targets OpenCode's **1.x** top-level
-routes (`POST /session`, `GET /fs/read/*`). OpenCode **2.x/3.x** moved every
-business endpoint behind an `/api/...` prefix, so the older wrapper returns
-`405`, the Web UI HTML, or crashes with `.map is not a function`.
-`opencode-http-mcp` was written to speak the current `/api/...` contract
-from the start.
+The community `opencode-mcp` 3.x package is TypeScript + `@opencode-ai/sdk`
++ zod and must be built before use. Its `OpenCodeClient` routes to whatever
+the installed SDK knows about — and the SDK currently only ships 1.x-style
+paths, so it does not match a running OpenCode **2.x/3.x** server that moved
+every business endpoint behind an `/api/...` prefix. The result: `405`,
+the Web UI HTML fallback, or `.map is not a function` crashes.
+
+`opencode-http-mcp` speaks the current `/api/...` contract from the start,
+with **full tooling parity** to `opencode-mcp 3.x` (all ~85 tools) grouped
+into layered modules, and **honest no-route fallbacks** for the small set of
+1.x-only endpoints that a 2.x build does not expose (instead of faking data).
+
+## Architecture (layered, mirrors upstream)
+
+```
+Layer 0    src/http.js      OpenCodeClient — HTTP + SSE + { data } unwrap
+Layer 0.5  src/helpers.js   formatting / result envelopes / redaction
+Layer 0.5  src/registry.js  tool registry
+Layer 0.5  src/util.js      arg helpers (dir / req / modelOpts)
+Layer 1    src/jobs.js      JobService — session-turn dispatch & observation
+Layer 2    src/tools/*.js   grouped tool modules (one per upstream file)
+Entry      src/index.js     stdio JSON-RPC MCP entry point
+```
+
+Upstream parity map:
+
+| upstream file | module | tools |
+|---|---|---|
+| session.ts | session.js | 20 |
+| message.ts | message.js | 6 |
+| file.ts | file.js | 6 |
+| config.ts | config.js | 3 |
+| provider.ts | provider.js | 6 |
+| project.ts | project.js | 3 |
+| misc.ts | misc.js | 12 |
+| global.ts | global.js | 1 |
+| events.ts | events.js | 1 |
+| input.ts | input.js | 5 |
+| tui.ts | tui.js | 9 |
+| workflow.ts | workflow.js | 10 |
+
+Total: **~85 tools**.
 
 ## Features
 
-- **Zero dependencies** — only `node:http` and `node:url` from the standard library.
-- **No build step** — point your MCP client at `index.js` and it runs.
+- **Zero dependencies** — only `node:http`, `node:https`, `node:url` from stdlib.
+- **No build step** — point your MCP client at `src/index.js` and it runs.
 - **Correct `/api/...` routing** for OpenCode 2.x/3.x.
-- **Basic + workflow tools** out of the box (see table below).
-- **Fire-and-forget / poll** primitives for background tasks.
+- **Full parity** with `opencode-mcp 3.x` tooling.
+- **Honest no-route fallbacks** — for 1.x-only endpoints a 2.x build lacks,
+  tools return a clear "unavailable on this build" message instead of 404s.
 
 ## Requirements
 
@@ -46,6 +84,7 @@ cd opencode-http-mcp
 | `OPENCODE_BASE_URL` | `http://127.0.0.1:49374` | Base URL of the OpenCode server |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | Basic-auth username |
 | `OPENCODE_SERVER_PASSWORD` | _(empty)_ | Basic-auth password |
+| `OPENCODE_TIMEOUT_MS` | `120000` | Per-request HTTP timeout (ms) |
 | `OPENCODE_AUTO_SERVE` | `false` | Reserved (currently not used) |
 
 > **Security note:** never commit a real `OPENCODE_SERVER_PASSWORD`.
@@ -60,7 +99,7 @@ Example for a client that reads `mcpServers`:
   "mcpServers": {
     "opencode": {
       "command": "node",
-      "args": ["/absolute/path/to/opencode-http-mcp/index.js"],
+      "args": ["/absolute/path/to/opencode-http-mcp/src/index.js"],
       "env": {
         "OPENCODE_BASE_URL": "http://192.168.123.101:49374",
         "OPENCODE_SERVER_USERNAME": "opencode",
@@ -71,39 +110,24 @@ Example for a client that reads `mcpServers`:
 }
 ```
 
-## Tools
+## Routes pinned (live-verified on OpenCode 2.0.30)
 
-### Basic
+Live 200 endpoints used by real tools:
+`/api/session`, `/api/session/{id}`, `/api/session/{id}/message`,
+`/api/session/{id}/prompt`, `/api/session/{id}/diff`, `/api/session/{id}/fork`,
+`/api/agent`, `/api/command`, `/api/config`, `/api/vcs`, `/api/vcs/status`,
+`/api/provider`, `/api/model`, `/api/project`, `/api/skill`, `/api/mcp`,
+`/api/integration`, `/api/reference`, `/api/pty`, `/api/event`,
+`/global/health`, `/global/event`.
 
-| Tool | Description |
-|---|---|
-| `opencode_health` | Server health + provider count |
-| `opencode_session_list` | List all OpenCode sessions |
-| `opencode_session_create` | Create a new session |
-| `opencode_message_list` | Read all messages in a session |
-| `opencode_file_read` | Read a file on the server (via `/api/fs/read`) |
-| `opencode_agent_list` | List available agents |
-| `opencode_provider_list` | List configured LLM providers |
-| `opencode_config` | Read server configuration |
-| `opencode_ask` | Send a prompt and poll for the assistant's reply |
-
-### Workflow
-
-| Tool | Description |
-|---|---|
-| `opencode_setup` | Environment setup (currently a no-op acknowledgement) |
-| `opencode_run` | Alias of `opencode_ask` |
-| `opencode_fire` | Alias of `opencode_ask` (fire-and-forget) |
-| `opencode_wait` | Poll a session/job until it finishes or times out |
-| `opencode_check` | Basic session/job status (message counts, optional last message) |
-| `opencode_job_list` | List jobs (placeholder — server has no job API yet) |
-| `opencode_job_get` | Get a job (placeholder) |
-| `opencode_job_cancel` | Cancel a job (placeholder) |
-| `opencode_job_input` | Send input to a job (placeholder) |
-
-> The `job_*` tools are placeholders. OpenCode currently does not expose a
-> job-management HTTP API; they will be wired to real endpoints once the
-> server provides them.
+Honest no-route fallbacks (1.x-only, 404 on 2.0.30):
+`/api/fs/find` → `opencode_find_text|file|symbol`;
+`/api/question`, `/api/permission` → `opencode_question_*`, `opencode_job_input`;
+`/api/provider/auth`, `/api/provider/{id}/oauth/*`, `/api/auth/{id}`;
+`/api/tui/*` → `opencode_tui_*`;
+`/api/path`, `/api/lsp`, `/api/formatter`, `/api/log`,
+`/api/instance/dispose`, `/api/project/current`,
+`/api/session/{id}/abort|todo|status|share|summarize|revert|unrevert|children`.
 
 ## Run the smoke test
 
@@ -114,26 +138,8 @@ OPENCODE_SERVER_PASSWORD=*** \
 node test.js
 ```
 
-The test exercises `tools/list` and a couple of read-only tools
-(`opencode_health`, `opencode_session_list`) against a live server.
-
-## How it works (architecture)
-
-```
-MCP client (stdio JSON-RPC)
-        │  initialize / tools/list / tools/call
-        ▼
-index.js  ── node:readline  ──► hand-rolled JSON-RPC handler
-        │
-        └── node:http  ──►  OpenCode server  /api/...  (Basic Auth)
-```
-
-- **Protocol layer** (`handle`): parses one JSON-RPC line at a time, answers
-  `initialize`, `tools/list`, `tools/call`, and returns the standard
-  `content: [{type:'text', text}]` shape.
-- **HTTP layer** (`api`): a small promise wrapper around `http.request` with
-  a 15 s timeout and JSON parsing; every business call is prefixed with
-  `/api/` as OpenCode 2.x/3.x requires.
+The test exercises `tools/list` plus a handful of read-only and no-route
+tools against a live server.
 
 ## License
 

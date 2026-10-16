@@ -24,7 +24,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 
 const HERE = __dirname;
-const SERVER = path.join(HERE, 'index.js');
+const SERVER = path.join(HERE, 'src', 'index.js');
 
 const children = new Map(); // id -> { resolve, timer }
 let proc;
@@ -73,7 +73,10 @@ async function main() {
   const list = await rpc(2, 'tools/list');
   const names = (list.tools || []).map((t) => t.name);
   console.log(`[ok] tools/list -> ${names.length} tools`);
-  const required = ['opencode_health', 'opencode_ask', 'opencode_session_list'];
+  const required = ['opencode_health', 'opencode_ask', 'opencode_session_list',
+    'opencode_message_list', 'opencode_provider_list', 'opencode_agent_list',
+    'opencode_vcs_info', 'opencode_mcp_status', 'opencode_events_poll',
+    'opencode_context', 'opencode_review_changes', 'opencode_setup'];
   const missing = required.filter((n) => !names.includes(n));
   if (missing.length) {
     console.error(`[FAIL] missing expected tools: ${missing.join(', ')}`);
