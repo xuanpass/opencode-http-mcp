@@ -38,7 +38,14 @@ const groups = [
   require('./tools/workflow.js'),
 ];
 
-const CAPABILITIES = { tools: {}, prompts: {}, resources: {}, extensions: {} };
+const CAPABILITIES = { tools: {}, prompts: {}, resources: {}, extensions: { "io.modelcontextprotocol/tasks": {} } };
+const CACHE_HINTS = {
+  "tools/list": { ttlMs: 60000, cacheScope: "private" },
+  "prompts/list": { ttlMs: 60000, cacheScope: "private" },
+  "resources/list": { ttlMs: 60000, cacheScope: "private" },
+  "resources/templates/list": { ttlMs: 60000, cacheScope: "private" },
+  "resources/read": { ttlMs: 0, cacheScope: "private" }
+};
 const SERVER_INFO = {
   name: 'opencode-http-mcp',
   version: '3.0.0',
@@ -168,6 +175,7 @@ async function main() {
           protocolVersion: params?.protocolVersion || '2025-06-18',
           capabilities: CAPABILITIES,
           serverInfo: SERVER_INFO,
+          cacheHints: CACHE_HINTS,
           instructions: 'Bridge to an OpenCode 2.x server. Routes pinned to /api/... with honest no-route fallbacks.',
         });
         break;

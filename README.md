@@ -124,6 +124,7 @@ short-task tools     JobService (jobs.js) ← Layer 1: multi-call state machine
 | Server auto-spawn (`opencode serve`) | ✅ server-manager.ts | ✅ implemented (enabled via OPENCODE_AUTO_SERVE=true) |
 | MCP form elicitation for pending inputs | ✅ task-input.ts | ✅ text fallback (relies on client-side input via job_input) |
 | Test suite | ✅ vitest | ✅ `test.js` + live smoke (extended unit tests) |
+| CacheHints | ✅ (cacheHints in initialize) | ✅ implemented (tools/list, prompts/list, resources/list, resources/templates/list, resources/read) |
 | Build / dependencies | TS + sdk + zod, build step | zero-dep, no build |
 
 ## Features
