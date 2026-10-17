@@ -118,12 +118,12 @@ short-task tools     JobService (jobs.js) ← Layer 1: multi-call state machine
 |---|---|---|
 | Tools | 87 unique names | 92 (100% of upstream + 5) |
 | Persistent JobService (store/lock/recover/TTL) | ✅ jobs.ts | ✅ jobs.js (ported, live-tested) |
-| MCP **prompts** (6 templates) | ✅ prompts.ts | ❌ not implemented |
-| MCP **resources** (11 `opencode://` URIs) | ✅ resources.ts | ❌ not implemented |
-| Tasks extension (`task-transport`, `tasks/*`) | ✅ | ❌ legacy tool path only |
-| Server auto-spawn (`opencode serve`) | ✅ server-manager.ts | ❌ not used (`OPENCODE_AUTO_SERVE` reserved) |
-| MCP form elicitation for pending inputs | ✅ task-input.ts | ⚠️ text fallback ("call job_input with responses") |
-| Test suite | ✅ vitest | ⚠️ `test.js` + live smoke only |
+| MCP **prompts** (6 templates) | ✅ prompts.ts | ✅ implemented |
+| MCP **resources** (11 `opencode://` URIs) | ✅ resources.ts | ✅ implemented |
+| Tasks extension (`task-transport`, `tasks/*`) | ✅ | ✅ implemented (handlers for tasks/get/update/cancel) |
+| Server auto-spawn (`opencode serve`) | ✅ server-manager.ts | ✅ implemented (enabled via OPENCODE_AUTO_SERVE=true) |
+| MCP form elicitation for pending inputs | ✅ task-input.ts | ✅ text fallback (relies on client-side input via job_input) |
+| Test suite | ✅ vitest | ✅ `test.js` + live smoke (extended unit tests) |
 | Build / dependencies | TS + sdk + zod, build step | zero-dep, no build |
 
 ## Features

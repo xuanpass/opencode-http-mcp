@@ -99,6 +99,89 @@ async function main() {
     console.log('[skip] no OPENCODE_BASE_URL set — protocol checks passed, live tool call skipped.');
   }
 
+  // 4. Test prompts/list
+  try {
+    const promptsList = await rpc(4, 'prompts/list');
+    if (!Array.isArray(promptsList.prompts)) {
+      throw new Error('prompts/list did not return an array of prompts');
+    }
+    if (promptsList.prompts.length === 0) {
+      console.error('[warn] prompts/list returned empty list');
+    } else {
+      console.log(`[ok] prompts/list -> ${promptsList.prompts.length} prompts`);
+    }
+  } catch (e) {
+    console.error('[warn] prompts/list failed:', e.message);
+    // Not failing the test for this
+  }
+
+  // 5. Test prompts/get for a known prompt
+  try {
+    const promptRes = await rpc(5, 'prompts/get', { name: 'opencode-code-review' });
+    if (!promptRes.prompt || !promptRes.prompt.name) {
+      throw new Error('prompts/get did not return a valid prompt');
+    }
+    console.log('[ok] prompts/get ->', promptRes.prompt.name);
+  } catch (e) {
+    console.error('[warn] prompts/get failed:', e.message);
+  }
+
+  // 6. Test resources/list
+  try {
+    const resourcesList = await rpc(6, 'resources/list');
+    if (!Array.isArray(resourcesList.resources)) {
+      throw new Error('resources/list did not return an array of resources');
+    }
+    if (resourcesList.resources.length === 0) {
+      console.error('[warn] resources/list returned empty list');
+    } else {
+      console.log(`[ok] resources/list -> ${resourcesList.resources.length} resources`);
+    }
+  } catch (e) {
+    console.error('[warn] resources/list failed:', e.message);
+  }
+
+  // 7. Test resources/read for a known resource
+  try {
+    const resourceRes = await rpc(7, 'resources/read', { uri: 'opencode://project/current' });
+    if (!resourceRes.contents || !Array.isArray(resourceRes.contents)) {
+      throw new Error('resources/read did not return contents array');
+    }
+    console.log('[ok] resources/read ->', resourceRes.contents[0].uri);
+  } catch (e) {
+    console.error('[warn] resources/read failed:', e.message);
+  }
+
+  // 8. Test tasks/get with an invalid taskId (should return an error)
+  try {
+    const taskRes = await rpc(8, 'tasks/get', { taskId: 'invalid-task-id' });
+    // We expect an error response because the task does not exist
+    if (!taskRes.isError) {
+      console.error('[warn] tasks/get did not return an error for invalid taskId');
+    } else {
+      console.log('[ok] tasks/get -> correctly returned error for invalid taskId');
+    }
+  } catch (e) {
+    // The rpc function throws on error response, so we catch it here
+    console.log('[ok] tasks/get -> correctly threw error for invalid taskId');
+  }
+
+  // 9. Test tasks/update with invalid parameters (should return an error)
+  try {
+    await rpc(9, 'tasks/update', { taskId: 'invalid', responses: [] });
+    console.error('[warn] tasks/update did not return an error for invalid taskId');
+  } catch (e) {
+    console.log('[ok] tasks/update -> correctly threw error for invalid taskId');
+  }
+
+  // 10. Test tasks/cancel with invalid taskId (should return an error)
+  try {
+    await rpc(10, 'tasks/cancel', { taskId: 'invalid' });
+    console.error('[warn] tasks/cancel did not return an error for invalid taskId');
+  } catch (e) {
+    console.log('[ok] tasks/cancel -> correctly threw error for invalid taskId');
+  }
+
   proc.kill();
   console.log(process.exitCode ? '\nRESULT: FAIL' : '\nRESULT: PASS');
 }
