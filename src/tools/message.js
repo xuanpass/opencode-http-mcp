@@ -4,7 +4,7 @@
  * the synchronous "send and wait" call; prompt_async is fire-and-forget.
  */
 'use strict';
-const { toolResult, toolError, formatMessageResponse, formatMessageList, analyzeMessageResponse, directoryParam } = require('../helpers.js');
+const { toolResult, toolError, formatMessageResponse, formatMessageList, analyzeMessageResponse, directoryParam, waitForSnapshot } = require('../helpers.js');
 const { dir, req, modelOpts } = require('../util.js');
 const { createMessageId } = require('../jobs.js');
 
@@ -14,7 +14,7 @@ function modelFromBody(a) {
 }
 
 function register(registry, ctx) {
-  const { client } = ctx;
+  const { client, jobs } = ctx;
   const R = (name, desc, schema, fn) => registry.tool(name, desc, { inputSchema: schema, run: fn });
 
   R('opencode_message_list', 'List all messages in a session with formatted roles and content.', {
@@ -67,19 +67,26 @@ function register(registry, ctx) {
     required: ['sessionId', 'text'],
   }, async (a) => {
     try {
-      const body = { parts: [{ type: 'text', text: a.text }] };
-      Object.assign(body, modelFromBody(a));
-      if (a.noReply !== undefined) body.noReply = a.noReply;
-      if (a.system) body.system = a.system;
-      const response = await client.post(
-        `/api/session/${encodeURIComponent(a.sessionId)}/prompt`, body, req(a),
-      );
-      const analysis = analyzeMessageResponse(response);
-      const formatted = formatMessageResponse(response);
-      const parts = [];
-      if (formatted) parts.push(formatted);
-      if (analysis.warning) parts.push(`\n--- WARNING ---\n${analysis.warning}`);
-      return toolResult(parts.join('\n\n') || 'Empty response.', analysis.hasError, { data: response });
+      // 2.0.30 /prompt is fire-and-forget, so a send-and-wait must dispatch
+      // AND observe via the JobService to actually return the assistant reply.
+      const opts = modelOpts(a) || {};
+      const started = await jobs.start(
+        { prompt: a.text, sessionId: a.sessionId, directory: a.directory,
+          model: opts.model, variant: opts.variant, agent: opts.agent, format: opts.format,
+          system: a.system },
+        {});
+      if (['failed', 'unknown', 'cancelled', 'input_required'].includes(started.status)) {
+        return toolResult(`Session: ${a.sessionId}\nStatus: ${started.status}\n${started.error ? `Error: ${JSON.stringify(started.error)}` : ''}`, true, started);
+      }
+      // noReply=true → dispatch and return the job handle immediately.
+      if (a.noReply) {
+        return toolResult(`Message dispatched (noReply).\nJob: ${started.jobId}\nSession: ${a.sessionId}`, false, { sessionId: a.sessionId, jobId: started.jobId, status: 'submitted' });
+      }
+      const obs = await waitForSnapshot(jobs, started.jobId, 300, 1500, {});
+      const lines = [];
+      if (obs.error) lines.push(`--- WARNING ---\n${JSON.stringify(obs.error)}`);
+      if (obs.text) lines.push(obs.text);
+      return toolResult(lines.join('\n\n') || 'Empty response.', obs.status === 'failed' || obs.timedOut, { sessionId: a.sessionId, jobId: started.jobId, status: obs.status, data: obs });
     } catch (e) { return toolError(e); }
   });
 
@@ -95,7 +102,10 @@ function register(registry, ctx) {
   }, async (a) => {
     const messageId = createMessageId();
     try {
-      const body = { messageID: messageId, parts: [{ type: 'text', text: a.text }] };
+      // 2.x /prompt contract: top-level `text`. The client-coined messageID is
+      // kept for correlation but 2.0.30 returns its own server-side id, so the
+      // wait path falls back to the session's latest turn.
+      const body = { text: a.text, messageID: messageId };
       Object.assign(body, modelFromBody(a));
       let sent = false;
       try {
@@ -103,6 +113,7 @@ function register(registry, ctx) {
         sent = true;
       } catch {
         // Fall back to sync prompt when /prompt_async is not available.
+        // On 2.0.30 /prompt is itself fire-and-forget (returns immediately).
         await client.post(`/api/session/${encodeURIComponent(a.sessionId)}/prompt`, body, req(a));
       }
       return toolResult(

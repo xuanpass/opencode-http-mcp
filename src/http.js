@@ -16,8 +16,27 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const { abortableSleep, abortReason, throwIfAborted } = require('./async.js');
 
 const HEALTH_PATH = '/global/health'; // 2.x verified working route
+const MAX_RETRIES = 2;      // GET-only
+const BASE_DELAY_MS = 500;
+
+/** True for network-level failures that a bounded GET retry may recover from. */
+function isConnectionError(err) {
+  const msg = ((err && err.message) || '').toLowerCase();
+  return (
+    msg.includes('econnrefused') ||
+    msg.includes('enotfound') ||
+    msg.includes('ehostunreach') ||
+    msg.includes('fetch failed') ||
+    msg.includes('network error') ||
+    msg.includes('socket hang up') ||
+    msg.includes('timeout') ||
+    msg.includes('etimedout') ||
+    msg.includes('econnreset')
+  );
+}
 
 class OpenCodeError extends Error {
   constructor(message, status, method, path, body) {
@@ -33,6 +52,25 @@ class OpenCodeError extends Error {
   }
   get isNotFound() { return this.status === 404; }
   get isAuth() { return this.status === 401 || this.status === 403; }
+}
+
+/**
+ * A write was dispatched but the outcome is unknown (response lost / socket
+ * dropped before a status arrived). OpenCode may have accepted it — unlike a
+ * plain error, this MUST NOT be retried or replayed, or the prompt runs twice.
+ */
+class OpenCodeSubmissionError extends Error {
+  constructor(method, path, cause) {
+    super(
+      `${method} ${path}: submission outcome unknown; the server may have accepted this operation. ` +
+      `Check its session before retrying. ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    this.name = 'OpenCodeSubmissionError';
+    this.method = method;
+    this.path = path;
+    this.submissionOutcome = 'unknown';
+    this.cause = cause;
+  }
 }
 
 function buildAuth(user, pass) {
@@ -60,7 +98,12 @@ class OpenCodeClient {
    * Core request. Returns unwrapped `.data` when present, else the parsed body.
    * Throws OpenCodeError on non-2xx.
    */
-  request(method, path, { query, body, directory, timeoutMs } = {}) {
+  /**
+   * One raw HTTP round trip. No retries, no submission bookkeeping — that
+   * lives in request(). Resolves to the unwrapped `.data` (or the parsed
+   * body) on 2xx; rejects with OpenCodeError otherwise.
+   */
+  _doOnce(method, path, { query, body, directory, timeoutMs, signal } = {}) {
     return new Promise((resolve, reject) => {
       const u = new URL(this.baseUrl + path);
       if (query) {
@@ -79,6 +122,8 @@ class OpenCodeClient {
         headers['Content-Type'] = 'application/json';
         headers['Content-Length'] = Buffer.byteLength(data);
       }
+      let settled = false;
+      const settle = (fn) => { if (settled) return; settled = true; fn(); };
       const req = lib.request(
         {
           method,
@@ -96,36 +141,106 @@ class OpenCodeClient {
             let json = null;
             try { json = chunks ? JSON.parse(chunks) : null; } catch { /* keep raw */ }
             if (!ok) {
-              reject(new OpenCodeError(
+              settle(() => reject(new OpenCodeError(
                 `${method} ${path} failed (${res.statusCode}): ${String(chunks).slice(0, 400)}`,
                 res.statusCode, method, path, chunks,
-              ));
+              )));
               return;
             }
-            // Unwrap the 2.x `{ data }` envelope when present.
             if (json && typeof json === 'object' && 'data' in json && !Array.isArray(json)) {
-              resolve(json.data !== undefined ? json.data : json);
+              settle(() => resolve(json.data !== undefined ? json.data : json));
             } else {
-              resolve(json);
+              settle(() => resolve(json));
             }
           });
         },
       );
-      const t = timeoutMs ? req.setTimeout(timeoutMs, () => {
-        req.destroy(new Error(`timeout after ${timeoutMs}ms: ${method} ${path}`));
-      }) : null;
-      req.on('error', (e) => reject(new OpenCodeError(String(e.message), 0, method, path, String(e))));
+      // timeoutMs === 0 means "no client-side timeout" (used by
+      // fire-and-forget dispatch, which keeps the socket open until the
+      // server finishes the turn on its own).
+      const tm = timeoutMs != null ? timeoutMs : this.timeoutMs;
+      if (tm > 0) {
+        req.setTimeout(tm, () => {
+          settle(() => req.destroy(new Error(`timeout after ${tm}ms: ${method} ${path}`)));
+        });
+      }
+      req.on('error', (e) => settle(() => reject(new OpenCodeError(String(e.message), 0, method, path, String(e)))));
+      if (signal) {
+        const onAbort = () => settle(() => req.destroy(abortReason(signal)));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+        req.on('close', () => signal.removeEventListener('abort', onAbort));
+      }
       if (data) req.write(data);
       req.end();
-      if (t) req.on('close', () => req.setTimeout(0));
     });
   }
 
-  get(path, query, directory) { return this.request('GET', path, { query, directory }); }
-  post(path, body, opts) { return this.request('POST', path, { ...opts, body }); }
-  patch(path, body, opts) { return this.request('PATCH', path, { ...opts, body }); }
-  put(path, body, opts) { return this.request('PUT', path, { ...opts, body }); }
-  delete(path, query, opts) { return this.request('DELETE', path, { ...(opts || {}), query }); }
+  /**
+   * Core request with cancellation + bounded GET retry + write protection.
+   *
+   * `options` is a RequestOptions bag ({ signal, deadline, timeout }) — the
+   * same shape JobService threads through. A caller abort is a pre-flight
+   * cancel (not a submission loss). A write that fails before a status is
+   * known is an OpenCodeSubmissionError: the server may have accepted it, so
+   * it must never be replayed. GETs retry a couple of times on transient
+   * statuses and connection errors.
+   */
+  async request(method, path, { query, body, directory, timeoutMs, signal, deadline, timeout } = {}) {
+    const readOnly = method === 'GET';
+    throwIfAborted(signal);
+    const t = timeoutMs || timeout || this.timeoutMs;
+    if (deadline !== undefined && Number.isFinite(deadline)) {
+      const remaining = deadline - Date.now();
+      const effective = t !== undefined ? Math.min(t, Math.max(1, remaining)) : Math.max(1, remaining);
+      return this._doOnce(method, path, { query, body, directory, timeoutMs: effective, signal });
+    }
+    let lastError;
+    const attempts = readOnly ? MAX_RETRIES + 1 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      throwIfAborted(signal);
+      if (attempt > 0) await abortableSleep(BASE_DELAY_MS * Math.pow(2, attempt - 1), signal);
+      try {
+        return await this._doOnce(method, path, { query, body, directory, timeoutMs: t, signal });
+      } catch (e) {
+        throwIfAborted(signal);
+        lastError = e;
+        if (!readOnly) {
+          if (e instanceof OpenCodeError) throw e;
+          throw new OpenCodeSubmissionError(method, path, e);
+        }
+        if (e instanceof OpenCodeError && !e.isTransient) throw e;
+        if (!(e instanceof OpenCodeError) && !isConnectionError(e)) throw e;
+      }
+    }
+    if (lastError instanceof OpenCodeError && lastError.status === 0 && isConnectionError(lastError)) {
+      throw new OpenCodeSubmissionError(method, path, lastError);
+    }
+    throw lastError || new Error(`${method} ${path} failed after retries`);
+  }
+
+  get(path, query, directory, options) { return this.request('GET', path, { query, directory, ...options }); }
+  post(path, body, opts) { return this.request('POST', path, { body, ...(opts || {}) }); }
+
+  /**
+   * Fire-and-forget POST: dispatches the request and does NOT wait for the
+   * response. The socket stays open until the server finishes the turn on
+   * its own (or the caller-supplied signal aborts it). Used for synchronous
+   * /prompt fallbacks when /prompt_async is absent: the caller wants
+   * fire-and-forget semantics without blocking the lock, so the turn outcome
+   * is observed later via /message instead of this response.
+   *
+   * Resolves once the request is flushed and 2xx headers arrive (or rejects
+   * on a hard client error / a non-2xx response) — but NEVER waits for the
+   * body. If the caller ignores the returned promise's rejection (via a
+   * .catch), the request continues server-side.
+   */
+  postFireAndForget(path, body, { directory, signal } = {}) {
+    return this._doOnce('POST', path, { body, directory, timeoutMs: 0, signal });
+  }
+  patch(path, body, opts) { return this.request('PATCH', path, { body, ...(opts || {}) }); }
+  put(path, body, opts) { return this.request('PUT', path, { body, ...(opts || {}) }); }
+  delete(path, query, opts) { return this.request('DELETE', path, { query, ...(opts || {}) }); }
 
   health() { return this.request('GET', HEALTH_PATH); }
 

@@ -47,7 +47,17 @@ function main() {
   const timeoutMs = Number(process.env.OPENCODE_TIMEOUT_MS || 120000);
 
   const client = new OpenCodeClient({ baseUrl, username, password, timeoutMs });
-  const jobs = new JobService(client);
+  // Persistent JobService: storeRoot env → explicit dir; unset → platform
+  // state dir (%LOCALAPPDATA%/opencode-mcp/tasks/<scope> on Windows,
+  // ~/.local/state/opencode-mcp/tasks/<scope> on POSIX). Pass null for a
+  // process-local in-memory store (tests / ephemeral use).
+  const storeRootEnv = process.env.OPENCODE_MCP_STORE_ROOT;
+  const storeRoot = storeRootEnv === '' ? null : (storeRootEnv || undefined);
+  const jobs = new JobService(client, {
+    storeRoot,
+    scope: process.env.OPENCODE_MCP_SCOPE || 'default',
+    ttlMs: Number(process.env.OPENCODE_MCP_TTL_MS) || 24 * 60 * 60 * 1000,
+  });
   const registry = new Registry();
 
   for (const g of groups) {

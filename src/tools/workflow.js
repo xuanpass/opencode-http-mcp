@@ -1,18 +1,28 @@
 /**
  * Tool group: workflow (upstream src/tools/workflow.ts)
  * High-level composite operations. Routes pinned to live-verified 2.0.30.
- * Sub-routes that DO NOT exist on 2.0.30 (abort, todo, status, share,
- * summarize, revert, unrevert, children, permissions) are NOT called;
- * the session-turn JobService model observes /message + /active only.
+ *
+ * Durable job model (JobService, persistent): a "job" is a session turn with
+ * a durable jobId. start() submits once (fire); get(jobId) observes ONCE —
+ * the WAIT loop lives here in waitForSnapshot, mirroring upstream. The
+ * session-observation helper (observeSession) is shared by the
+ * session-based tools and the job engine.
+ *
+ * 2.0.30 honest degradation: /prompt_async, /session/{id}/abort and the
+ * /question /permission reply routes 404 — the JobService surfaces these as
+ * "unknown" states with explanatory notes rather than crashing, and
+ * fire-and-forget / check / wait / job_list / job_update / job_cancel all
+ * remain usable.
  */
 'use strict';
 const {
   toolResult, toolError, formatMessageResponse, formatMessageList,
   formatSessionList, analyzeMessageResponse, formatDiffResponse,
   resolveSessionStatus, isProviderConfigured, applyModelDefaults,
-  redactSecrets, directoryParam,
+  redactSecrets, directoryParam, waitForSnapshot,
 } = require('../helpers.js');
-const { dir, req, modelOpts } = require('../util.js');
+const { dir, req } = require('../util.js');
+const { observeSession } = require('../jobs.js');
 
 function providersOf(raw) {
   if (raw && typeof raw === 'object' && 'all' in raw) return raw.all;
@@ -81,19 +91,23 @@ function register(registry, ctx) {
   }, async (a) => {
     let sessionId;
     try {
-      const session = await client.post('/api/session', { title: a.title ?? String(a.prompt).slice(0, 80), location: a.directory || null }, req(a));
-      sessionId = session?.id;
-      if (!sessionId) throw new Error('OpenCode returned a session without an ID');
-      const body = { parts: [{ type: 'text', text: a.prompt }] };
-      Object.assign(body, modelOpts(a));
-      if (a.system) body.system = a.system;
-      const response = await client.post(`/api/session/${encodeURIComponent(sessionId)}/prompt`, body, req(a));
-      const analysis = analyzeMessageResponse(response);
-      const formatted = formatMessageResponse(response);
-      const parts = [`Session: ${sessionId}`];
-      if (formatted) parts.push(formatted);
-      if (analysis.warning) parts.push(`\n--- WARNING ---\n${analysis.warning}`);
-      return toolResult(parts.join('\n\n'), analysis.hasError, { sessionId, data: response });
+      // 2.0.30's /prompt is fire-and-forget (returns the user message, not the
+      // assistant reply), so a one-shot ask must dispatch AND observe via the
+      // JobService rather than treating the POST response as the answer.
+      const model = applyModelDefaults(a.providerID, a.modelID);
+      const started = await jobs.start(
+        { prompt: a.prompt, sessionId: a.sessionId, title: a.title ?? String(a.prompt).slice(0, 80),
+          directory: a.directory, model, variant: a.variant, agent: a.agent, format: a.format, system: a.system },
+        {});
+      sessionId = started.sessionId;
+      if (['failed', 'unknown', 'cancelled', 'input_required'].includes(started.status)) {
+        return toolResult(`Session: ${sessionId}\nStatus: ${started.status}\n${started.error ? `Error: ${JSON.stringify(started.error)}` : ''}`, true, started);
+      }
+      const obs = await waitForSnapshot(jobs, started.jobId, 300, 1500, {});
+      const lines = [`Session: ${sessionId}`];
+      if (obs.error) lines.push(`--- WARNING ---\n${JSON.stringify(obs.error)}`);
+      if (obs.text) lines.push(obs.text);
+      return toolResult(lines.join('\n\n') || 'Empty response.', obs.status === 'failed' || obs.timedOut, { sessionId, jobId: started.jobId, status: obs.status, data: obs });
     } catch (e) {
       return { ...toolError(e), structuredContent: { sessionId, directory: a.directory } };
     }
@@ -111,15 +125,21 @@ function register(registry, ctx) {
     required: ['sessionId', 'prompt'],
   }, async (a) => {
     try {
-      const body = { parts: [{ type: 'text', text: a.prompt }] };
-      Object.assign(body, modelOpts(a));
-      const response = await client.post(`/api/session/${encodeURIComponent(a.sessionId)}/prompt`, body, req(a));
-      const analysis = analyzeMessageResponse(response);
-      const formatted = formatMessageResponse(response);
-      const parts = [];
-      if (formatted) parts.push(formatted);
-      if (analysis.warning) parts.push(`\n--- WARNING ---\n${analysis.warning}`);
-      return toolResult(parts.join('\n\n') || 'Empty response.', analysis.hasError, { sessionId: a.sessionId, data: response });
+      // Fire-and-forget /prompt → observe the turn via the JobService so we
+      // return the assistant's reply, not the user message we just sent.
+      const model = applyModelDefaults(a.providerID, a.modelID);
+      const started = await jobs.start(
+        { prompt: a.prompt, sessionId: a.sessionId, directory: a.directory,
+          model, variant: a.variant, agent: a.agent, format: a.format },
+        {});
+      if (['failed', 'unknown', 'cancelled', 'input_required'].includes(started.status)) {
+        return toolResult(`Session: ${a.sessionId}\nStatus: ${started.status}\n${started.error ? `Error: ${JSON.stringify(started.error)}` : ''}`, true, started);
+      }
+      const obs = await waitForSnapshot(jobs, started.jobId, 300, 1500, {});
+      const lines = [];
+      if (obs.error) lines.push(`--- WARNING ---\n${JSON.stringify(obs.error)}`);
+      if (obs.text) lines.push(obs.text);
+      return toolResult(lines.join('\n\n') || 'Empty response.', obs.status === 'failed' || obs.timedOut, { sessionId: a.sessionId, jobId: started.jobId, status: obs.status, data: obs });
     } catch (e) { return { ...toolError(e), structuredContent: { sessionId: a.sessionId, directory: a.directory } }; }
   });
 
@@ -193,48 +213,50 @@ function register(registry, ctx) {
     } catch (e) { return toolError(e); }
   });
 
-  // ─── Wait for a session turn ───────────────────────────────────────
-  R('opencode_wait', 'Wait for a session turn to complete by observing /message + /active.', {
+  // ─── Wait for a job / session turn ────────────────────────────────
+  R('opencode_wait', 'Wait for a job (jobId) or a session turn (sessionId) to complete. A timeout leaves the remote job running; resume with a longer wait.', {
     type: 'object',
     properties: {
+      jobId: { type: 'string' },
       sessionId: { type: 'string' }, messageId: { type: 'string' },
       timeoutSeconds: { type: 'number', maximum: 86400 },
       pollIntervalMs: { type: 'number', minimum: 10, maximum: 60000 },
       directory: directoryParam,
     },
-    required: ['sessionId'],
   }, async (a) => {
+    if (!a.jobId && !a.sessionId) {
+      return toolResult('Provide jobId (durable job) or sessionId (ad-hoc session) to wait on.', true);
+    }
     try {
+      // Durable job path: delegate the whole wait to the JobService.
+      if (a.jobId) {
+        const seconds = a.timeoutSeconds ?? 120;
+        const obs = await waitForSnapshot(jobs, a.jobId, seconds, a.pollIntervalMs ?? 1000, {});
+        const lines = [`Job: ${obs.jobId ?? a.jobId}`, `Session: ${obs.sessionId ?? ''}`, `Status: ${obs.status}`];
+        if (obs.error) lines.push(`Error: ${JSON.stringify(obs.error)}`);
+        if (obs.text) lines.push(obs.text);
+        if (obs.note) lines.push(obs.note);
+        return toolResult(lines.join('\n'), obs.status === 'failed' || obs.timedOut, obs);
+      }
+      // Ad-hoc session path: single-shot observeSession, no durable job record.
       const deadline = (a.timeoutSeconds ?? 120) * 1000;
       const pollMs = a.pollIntervalMs ?? 2000;
       const start = Date.now();
-      let lastAssistant = '';
-      let sawAssistant = false;
+      let obs = { status: 'unknown' };
       while (Date.now() - start < deadline) {
         await sleep(pollMs);
-        let arr = [];
         try {
-          const msgs = await client.get(`/api/session/${encodeURIComponent(a.sessionId)}/message`, undefined, dir(a));
-          arr = Array.isArray(msgs) ? msgs : (msgs?.data || []);
+          obs = await observeSession(client, a.sessionId, dir(a), a.messageId);
         } catch { /* keep polling */ }
-        const assistant = arr.filter((m) => m && m.type === 'assistant');
-        if (assistant.length) {
-          lastAssistant = assistant.map((m) => formatMessageResponse(m)).join('\n---\n');
-          sawAssistant = true;
-        }
-        if (a.messageId) {
-          const matched = arr.find((m) => m && m.id === a.messageId && m.type === 'assistant');
-          if (matched) return toolResult(`Status: completed\n\n${formatMessageResponse(matched)}`, false, { sessionId: a.sessionId, messageId: a.messageId, status: 'completed' });
-        }
-        if (sawAssistant && !arr.some((m) => m && m.type === 'user')) break;
+        if (['completed', 'failed', 'cancelled', 'input_required'].includes(obs.status)) break;
       }
-      return toolResult(
-        sawAssistant ? `Status: completed\n\n${lastAssistant}` : `Status: timeout\n\nNo assistant reply captured within ${a.timeoutSeconds ?? 120}s.`,
-        !sawAssistant,
-        { sessionId: a.sessionId, messageId: a.messageId, status: sawAssistant ? 'completed' : 'timeout' },
-      );
+      const lines = [`Session: ${a.sessionId}`, `Status: ${obs.status}`];
+      if (obs.error) lines.push(`Error: ${JSON.stringify(obs.error)}`);
+      if (obs.text) lines.push(obs.text);
+      const done = ['completed'].includes(obs.status);
+      return toolResult(lines.join('\n'), !done && obs.status !== 'input_required', obs);
     } catch (e) {
-      return { ...toolError(e), structuredContent: { sessionId: a.sessionId, status: 'unknown' } };
+      return { ...toolError(e), structuredContent: { jobId: a.jobId, sessionId: a.sessionId, status: 'unknown' } };
     }
   });
 
@@ -276,21 +298,24 @@ function register(registry, ctx) {
           : null;
         if (!modelID) throw new Error(`No model discovered for provider "${a.providerId}". Specify modelID.`);
       }
-      const session = await client.post('/api/session', { title: `[test] ${a.providerId}`, location: a.directory || null }, req(a));
-      sessionId = session?.id;
-      const body = { parts: [{ type: 'text', text: 'Say hello in one word.' }] };
-      body.model = { providerID: a.providerId, modelID };
-      if (a.variant) body.variant = a.variant;
-      if (a.format) body.format = a.format;
-      const response = await client.post(`/api/session/${encodeURIComponent(sessionId)}/prompt`, body, req(a));
-      const analysis = analyzeMessageResponse(response);
-      const formatted = formatMessageResponse(response);
-      try { await client.delete(`/api/session/${encodeURIComponent(sessionId)}`, undefined, req(a)); } catch { /* best-effort */ }
-      if (analysis.hasError || analysis.isEmpty) {
-        return toolResult(`Provider "${a.providerId}" FAILED.\n\n${analysis.warning ?? 'No response received.'}`, true, { sessionId, data: response });
+      // Fire-and-forget /prompt → observe via the JobService (we must not
+      // treat the immediate POST response as the model's reply).
+      const started = await jobs.start(
+        { prompt: 'Say hello in one word.', sessionId: undefined, title: `[test] ${a.providerId}`,
+          directory: a.directory, model: { providerID: a.providerId, modelID }, variant: a.variant, format: a.format },
+        {});
+      sessionId = started.sessionId;
+      if (['failed', 'unknown', 'cancelled', 'input_required'].includes(started.status)) {
+        try { await client.delete(`/api/session/${encodeURIComponent(sessionId)}`, undefined, req(a)); } catch { /* best-effort */ }
+        return toolResult(`Provider "${a.providerId}" FAILED.\n\n${started.error ? JSON.stringify(started.error) : 'No response received.'}`, true, { sessionId, data: started });
       }
-      const preview = formatted.length > 200 ? formatted.slice(0, 200) + '...' : formatted;
-      return toolResult(`Provider "${a.providerId}" is working.\n\nResponse: ${preview}`, false, { sessionId, providerId: a.providerId, modelID, data: response });
+      const obs = await waitForSnapshot(jobs, started.jobId, 120, 1500, {});
+      try { await client.delete(`/api/session/${encodeURIComponent(sessionId)}`, undefined, req(a)); } catch { /* best-effort */ }
+      if (obs.status === 'failed' || obs.timedOut || !obs.text) {
+        return toolResult(`Provider "${a.providerId}" FAILED.\n\n${obs.error ? JSON.stringify(obs.error) : (obs.timedOut ? 'Timed out waiting for a reply.' : 'No response received.')}`, true, { sessionId, data: obs });
+      }
+      const preview = obs.text.length > 200 ? obs.text.slice(0, 200) + '...' : obs.text;
+      return toolResult(`Provider "${a.providerId}" is working.\n\nResponse: ${preview}`, false, { sessionId, providerId: a.providerId, modelID, data: obs });
     } catch (e) {
       if (sessionId) { try { await client.delete(`/api/session/${encodeURIComponent(sessionId)}`, undefined, req(a)); } catch { /* ignore */ } }
       return { ...toolError(e), structuredContent: { sessionId, providerId: a.providerId } };
@@ -298,7 +323,7 @@ function register(registry, ctx) {
   });
 
   // ─── Durable dispatch and observation ──────────────────────────────
-  R('opencode_run', 'Send a task and wait for its correlated response. Returns a job snapshot; observation timeout leaves the remote session running.', {
+  R('opencode_run', 'Send a task and wait for its correlated response. Returns a durable job id; an observation timeout leaves the remote job running and can be resumed with opencode_check.', {
     type: 'object',
     properties: {
       prompt: { type: 'string' }, sessionId: { type: 'string' }, title: { type: 'string' },
@@ -314,18 +339,21 @@ function register(registry, ctx) {
       snapshot = await jobs.start(
         { prompt: a.prompt, sessionId: a.sessionId, title: a.title, directory: a.directory,
           model, variant: a.variant, agent: a.agent, format: a.format }, {});
-      if (['failed', 'unknown', 'cancelled', 'dispatch_failed'].includes(snapshot.status)) {
-        return toolResult(`Job: ${snapshot.jobId}\nSession: ${snapshot.sessionId}\nStatus: ${snapshot.status}\n${snapshot.note ?? ''}`, true, snapshot);
+      if (['failed', 'unknown', 'cancelled', 'input_required'].includes(snapshot.status)) {
+        return toolResult(
+          `Job: ${snapshot.jobId}\nSession: ${snapshot.sessionId}\nStatus: ${snapshot.status}\n${snapshot.error ? `Error: ${JSON.stringify(snapshot.error)}` : (snapshot.note || '')}`,
+          true, snapshot);
       }
-      const obs = await jobs.get(snapshot.jobId, {
-        sessionId: snapshot.sessionId, directory: a.directory,
-        pollMs: 2000, deadline: (a.maxDurationSeconds ?? 600) * 1000,
-      });
-      return toolResult(
-        `Job: ${obs.jobId ?? snapshot.jobId}\nSession: ${obs.sessionId}\nStatus: ${obs.status}\n${obs.text ?? ''}`,
-        obs.status === 'timeout',
-        obs,
-      );
+      const seconds = a.maxDurationSeconds ?? 600;
+      const obs = await waitForSnapshot(jobs, snapshot.jobId, seconds, 1000, {});
+      const lines = [
+        `Job: ${obs.jobId ?? snapshot.jobId}`,
+        `Session: ${obs.sessionId ?? snapshot.sessionId}`,
+        `Status: ${obs.status}`,
+      ];
+      if (obs.error) lines.push(`Error: ${JSON.stringify(obs.error)}`);
+      if (obs.text) lines.push(obs.text);
+      return toolResult(lines.join('\n'), obs.status === 'failed' || obs.timedOut, obs);
     } catch (e) {
       return toolResult(`Job dispatch failed: ${e.message}`, true, { ...snapshot, status: 'failed', error: e.message });
     }
@@ -347,10 +375,10 @@ function register(registry, ctx) {
         { prompt: a.prompt, sessionId: a.sessionId, title: a.title, directory: a.directory,
           model, variant: a.variant, agent: a.agent, format: a.format }, {});
       const note = snap.status === 'accepted'
-        ? `Task dispatched. Use opencode_wait({sessionId: "${snap.sessionId}"}) to observe.`
-        : snap.note;
+        ? `Task dispatched. Use opencode_check({jobId: "${snap.jobId}"}) or opencode_wait({jobId: "${snap.jobId}"}) to observe it.`
+        : (snap.error ? `Error: ${JSON.stringify(snap.error)}` : (snap.note || ''));
       return toolResult(
-        `Job: ${snap.jobId}\nSession: ${snap.sessionId}\nStatus: ${snap.status}\n${note}`,
+        `Job: ${snap.jobId}\nSession: ${snap.sessionId ?? '(pending)'}\nStatus: ${snap.status}\n${note}`,
         snap.status !== 'accepted',
         snap,
       );
@@ -359,25 +387,91 @@ function register(registry, ctx) {
     }
   });
 
-  R('opencode_check', 'Get current task status by observing a session. Pass detailed for full response text.', {
+  R('opencode_check', 'Get current task status. Pass jobId (durable job) or sessionId (ad-hoc) for an exact read; detailed includes response text and pending inputs.', {
     type: 'object',
     properties: {
-      sessionId: { type: 'string' }, detailed: { type: 'boolean' }, directory: directoryParam,
+      jobId: { type: 'string' }, sessionId: { type: 'string' },
+      detailed: { type: 'boolean' }, directory: directoryParam,
     },
-    required: ['sessionId'],
+  }, async (a) => {
+    if (!a.jobId && !a.sessionId) return toolResult('Provide jobId or sessionId to check.', true);
+    try {
+      let obs;
+      if (a.jobId) obs = await jobs.get(a.jobId);
+      else obs = await observeSession(client, a.sessionId, dir(a), undefined);
+      const lines = [];
+      if (obs.jobId) lines.push(`Job: ${obs.jobId}`);
+      lines.push(`Session: ${obs.sessionId ?? a.sessionId}`);
+      lines.push(`Status: ${obs.status}`);
+      if (a.detailed && obs.error) lines.push(`Error: ${JSON.stringify(obs.error)}`);
+      if (a.detailed && obs.text) lines.push(`### Last message\n${String(obs.text).slice(0, 1000)}`);
+      if (obs.inputs && obs.inputs.length) lines.push(`Pending inputs: ${obs.inputs.map((i) => `${i.kind}:${i.id}`).join(', ')}`);
+      return toolResult(lines.join('\n'), obs.status === 'failed', obs);
+    } catch (e) {
+      return { ...toolError(e), structuredContent: { jobId: a.jobId, sessionId: a.sessionId, status: 'unknown' } };
+    }
+  });
+
+  R('opencode_job_list', 'List durable jobs (newest first) still within their TTL.', {
+    type: 'object',
+    properties: { limit: { type: 'number', minimum: 1, maximum: 1000 } },
   }, async (a) => {
     try {
-      const obs = await jobs.get('check', {
-        sessionId: a.sessionId, directory: a.directory,
-        pollMs: 1000, deadline: 5000,
+      const items = await jobs.list(a.limit ?? 50);
+      if (!items.length) return toolResult('No durable jobs recorded for this scope.');
+      const lines = items.map((j) => {
+        const created = j.createdAt ? new Date(j.createdAt).toISOString() : '?';
+        return `- ${j.jobId}\n    status: ${j.status}\n    session: ${j.sessionId ?? '(pending)'}\n    created: ${created}${j.error ? `\n    error: ${JSON.stringify(j.error)}` : ''}`;
       });
-      const lines = [];
-      lines.push(`Session: ${obs.sessionId}`);
-      lines.push(`Status: ${obs.status}`);
-      if (a.detailed && obs.text) lines.push(`### Last message\n${obs.text.slice(0, 500)}`);
-      return toolResult(lines.join('\n'), obs.status === 'timeout', obs);
+      return toolResult(`## Durable jobs (${items.length})\n${lines.join('\n')}`, false, { jobs: items });
+    } catch (e) { return toolError(e); }
+  });
+
+  R('opencode_job_cancel', 'Cancel a durable job. Refuses to abort a session whose newest turn is a different (newer) job.', {
+    type: 'object',
+    properties: { jobId: { type: 'string' } },
+    required: ['jobId'],
+  }, async (a) => {
+    try {
+      const snap = await jobs.cancel(a.jobId);
+      const lines = [`Job: ${snap.jobId}`, `Session: ${snap.sessionId ?? ''}`, `Status: ${snap.status}`];
+      if (snap.error) lines.push(`Error: ${JSON.stringify(snap.error)}`);
+      return toolResult(lines.join('\n'), snap.status === 'failed', snap);
     } catch (e) {
-      return { ...toolError(e), structuredContent: { sessionId: a.sessionId, status: 'unknown' } };
+      return { ...toolError(e), structuredContent: { jobId: a.jobId, status: 'unknown' } };
+    }
+  });
+
+  R('opencode_job_update', 'Answer a job\'s pending question/permission inputs. Pass the input id, kind, and (for questions) the array of answers, or (for permissions) a reply of once/always/reject.', {
+    type: 'object',
+    properties: {
+      jobId: { type: 'string' },
+      responses: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            kind: { type: 'string', enum: ['question', 'permission'] },
+            answers: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
+            reply: { type: 'string', enum: ['once', 'always', 'reject'] },
+            reject: { type: 'boolean' },
+            message: { type: 'string' },
+          },
+          required: ['id', 'kind'],
+        },
+      },
+    },
+    required: ['jobId', 'responses'],
+  }, async (a) => {
+    try {
+      const snap = await jobs.update(a.jobId, a.responses || []);
+      const lines = [`Job: ${snap.jobId}`, `Session: ${snap.sessionId ?? ''}`, `Status: ${snap.status}`];
+      if (snap.error) lines.push(`Error: ${JSON.stringify(snap.error)}`);
+      if (snap.text) lines.push(snap.text);
+      return toolResult(lines.join('\n'), snap.status === 'failed', snap);
+    } catch (e) {
+      return { ...toolError(e), structuredContent: { jobId: a.jobId, status: 'unknown' } };
     }
   });
 
@@ -387,14 +481,16 @@ function register(registry, ctx) {
   }, async (a) => {
     try {
       const d = dir(a);
-      const [health, providerRaw, sessions, vcs] = await Promise.all([
-        client.get('/global/health', undefined, d).catch(() => null),
+      let healthOk = false;
+      let health = null;
+      try { health = await client.get('/global/health', undefined, d); healthOk = true; } catch { healthOk = false; }
+      const [providerRaw, sessions, vcs] = await Promise.all([
         client.get('/api/provider', undefined, d).catch(() => null),
         client.get('/api/session', undefined, d).catch(() => null),
         client.get('/api/vcs', undefined, d).catch(() => null),
       ]);
       const lines = [];
-      if (health) lines.push(`Server: healthy (v${(health && health.version) ?? '?'})`);
+      if (healthOk) lines.push(`Server: healthy (v${(health && health.version) ?? '?'})`);
       else lines.push('Server: UNREACHABLE');
       if (providerRaw) {
         const providers = providersOf(providerRaw);

@@ -6,6 +6,40 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
+const { createRequestContext, abortableSleep, withAbort } = require('./async.js');
+
+/**
+ * Observe a durable job until it reaches a terminal or input_required state,
+ * or the deadline elapses. Each iteration is a single jobs.get(jobId) (one
+ * OpenCode status read) — the loop, not the JobService, owns the wait. A
+ * timeout leaves the remote job running and returns the last snapshot so a
+ * later check/wait can resume. Shared by the one-shot tools (ask/reply/
+ * provider_test/message_send) and the durable tools (run/wait).
+ */
+async function waitForSnapshot(jobs, jobId, seconds, intervalMs, extra = {}) {
+  const timeoutNote = 'Timeout: session still running or its outcome is unknown. Use opencode_check to read progress, opencode_wait to wait longer, or opencode_job_cancel to stop it.';
+  let snapshot;
+  try { snapshot = await jobs.get(jobId, { signal: extra.signal }); }
+  catch (e) { return { status: 'failed', timedOut: false, error: e instanceof Error ? e.message : String(e) }; }
+  if (seconds === 0) return { ...snapshot, timedOut: true };
+  const context = createRequestContext({ signal: extra.signal, timeout: seconds * 1000 });
+  try {
+    while (true) {
+      snapshot = await withAbort(jobs.get(jobId, { signal: context.signal }), context.signal);
+      if (['completed', 'failed', 'cancelled', 'input_required'].includes(snapshot.status)) return snapshot;
+      await abortableSleep(Math.min(intervalMs, Math.max(0, context.deadline - Date.now())), context.signal);
+    }
+  } catch (error) {
+    if (context.signal.aborted) {
+      if (extra.signal && extra.signal.aborted) return { ...snapshot, observationCancelled: true, note: 'Observation cancelled. The remote session may still be running.' };
+      return { ...snapshot, timedOut: true, note: timeoutNote };
+    }
+    return { ...snapshot, status: 'unknown', error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    context.dispose();
+  }
+}
 
 // ── Result envelopes (MCP tool results) ──────────────────────────────
 function toolResult(text, isError, structuredContent) {
@@ -30,6 +64,32 @@ const directoryParam = {
   description: 'Project directory to target. Optional; defaults to the server default project.',
 };
 
+/**
+ * Validate a project directory before it is forwarded as the
+ * `x-opencode-directory` header. Rejects control bytes (header
+ * smuggling), and requires an absolute path on the OpenCode server's
+ * filesystem — a client-relative path would silently target the wrong
+ * project. Mirrors upstream src/helpers.ts::normalizeDirectory.
+ * @returns the directory (string), or undefined when empty.
+ */
+function normalizeDirectory(directory) {
+  if (!directory) return undefined;
+  // Reject control bytes that could smuggle headers when forwarded.
+  if (/[\0\r\n]/.test(directory)) {
+    throw new Error('Invalid directory: path must not contain NUL or CR/LF characters.');
+  }
+  // Absolute on POSIX or on Windows (C:\, C:/ or \\server\share UNC).
+  const posixAbs = path.posix.isAbsolute(directory);
+  const windowsAbs = /^[a-z]:[\\/]/i.test(directory) || /^\\\\[^\\]+\\[^\\]+/i.test(directory);
+  if (!posixAbs && !windowsAbs) {
+    throw new Error(
+      `Invalid directory: "${directory}" is not an absolute path. ` +
+      'Use an absolute path on the OpenCode server, not a client-relative path.',
+    );
+  }
+  return directory;
+}
+
 // ── Message / response formatting ────────────────────────────────────
 function fmtText(msg) {
   if (msg == null) return '';
@@ -38,6 +98,11 @@ function fmtText(msg) {
   if (msg.payload && msg.payload.text != null) return String(msg.payload.text);
   if (Array.isArray(msg.parts)) {
     return msg.parts.map((p) => (p && p.text != null ? String(p.text) : '')).join('');
+  }
+  // 2.x message rows carry text in content[] (array of {type,text}); the 1.x
+  // parts[] layout is handled above.
+  if (Array.isArray(msg.content)) {
+    return msg.content.map((p) => (p && p.text != null ? String(p.text) : '')).join('');
   }
   if (msg.content != null) {
     return typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
@@ -180,6 +245,7 @@ module.exports = {
   toolJson,
   toolError,
   directoryParam,
+  normalizeDirectory,
   fmtText,
   roleOf,
   formatMessageResponse,
@@ -191,4 +257,5 @@ module.exports = {
   formatDiffResponse,
   redactSecrets,
   isProviderConfigured,
+  waitForSnapshot,
 };
