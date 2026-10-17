@@ -78,21 +78,10 @@ function register(registry, ctx) {
     }
   });
 
-  R('opencode_job_cancel', 'Abort the OpenCode session owned by a task.', {
-    type: 'object',
-    properties: {
-      sessionId: { type: 'string' },
-      directory: directoryParam,
-    },
-  }, async (a) => {
-    try {
-      if (!a.sessionId) return toolResult('opencode_job_cancel: a sessionId is required to abort.', true);
-      await client.post(`/api/session/${encodeURIComponent(a.sessionId)}/abort`, {}, { directory: dir(a) });
-      return toolResult(`Session ${a.sessionId} aborted.`, false, { sessionId: a.sessionId, status: 'cancelled' });
-    } catch (e) {
-      return toolResult(`opencode_job_cancel: ${e instanceof Error ? e.message : String(e)}`, true, { status: 'unknown' });
-    }
-  });
+  // NOTE: upstream also registers opencode_job_${get,cancel} here. Our
+  // durable-job variants (jobId-based, JobService-backed) live in
+  // workflow.js — registering a sessionId-based job_cancel here would
+  // collide (registry is a Map; last registration wins), so it is omitted.
 }
 
 module.exports = { register };

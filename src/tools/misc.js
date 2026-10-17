@@ -143,6 +143,44 @@ function register(registry, ctx) {
     } catch (e) { return toolError(e); }
   });
 
+  // --- LSP / Formatter / experimental tools (upstream misc.ts) ---
+  // 2.0.30 has no /api/lsp, /api/formatter, /api/experimental/tool* routes;
+  // register honest no-route fallbacks so the tool surface matches upstream.
+
+  R('opencode_lsp_status', 'Get the status of LSP (Language Server Protocol) servers.', {
+    type: 'object', properties: { directory: directoryParam },
+  }, async () => toolResult(
+    'opencode_lsp_status: /api/lsp is not available on this OpenCode server (2.x build).',
+    true,
+  ));
+
+  R('opencode_formatter_status', 'Get the status of configured formatters.', {
+    type: 'object', properties: { directory: directoryParam },
+  }, async () => toolResult(
+    'opencode_formatter_status: /api/formatter is not available on this OpenCode server (2.x build).',
+    true,
+  ));
+
+  R('opencode_tool_ids', 'List all available tool IDs that the LLM can use (experimental).', {
+    type: 'object', properties: { directory: directoryParam },
+  }, async () => toolResult(
+    'opencode_tool_ids: /api/experimental/tool/ids is not available on this OpenCode server (2.x build).',
+    true,
+  ));
+
+  R('opencode_tool_list', 'List tools with JSON schemas for a given provider and model (experimental).', {
+    type: 'object',
+    properties: {
+      provider: { type: 'string', description: 'Provider ID' },
+      model: { type: 'string', description: 'Model ID' },
+      directory: directoryParam,
+    },
+    required: ['provider', 'model'],
+  }, async () => toolResult(
+    'opencode_tool_list: /api/experimental/tool is not available on this OpenCode server (2.x build).',
+    true,
+  ));
+
   R('opencode_path_get', 'Get the current working path of the opencode server.', {
     type: 'object', properties: { directory: directoryParam },
   }, async () => toolResult(

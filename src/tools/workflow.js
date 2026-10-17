@@ -442,7 +442,20 @@ function register(registry, ctx) {
     }
   });
 
-  R('opencode_job_update', 'Answer a job\'s pending question/permission inputs. Pass the input id, kind, and (for questions) the array of answers, or (for permissions) a reply of once/always/reject.', {
+  // Upstream calls this opencode_job_input; opencode_job_update kept as an
+  // alias so existing callers don't break. Same implementation.
+  const jobUpdateFn = async (a) => {
+    try {
+      const snap = await jobs.update(a.jobId, a.responses || []);
+      const lines = [`Job: ${snap.jobId}`, `Session: ${snap.sessionId ?? ''}`, `Status: ${snap.status}`];
+      if (snap.error) lines.push(`Error: ${JSON.stringify(snap.error)}`);
+      if (snap.text) lines.push(snap.text);
+      return toolResult(lines.join('\n'), snap.status === 'failed', snap);
+    } catch (e) {
+      return { ...toolError(e), structuredContent: { jobId: a.jobId, status: 'unknown' } };
+    }
+  };
+  const jobUpdateSchema = {
     type: 'object',
     properties: {
       jobId: { type: 'string' },
@@ -463,17 +476,10 @@ function register(registry, ctx) {
       },
     },
     required: ['jobId', 'responses'],
-  }, async (a) => {
-    try {
-      const snap = await jobs.update(a.jobId, a.responses || []);
-      const lines = [`Job: ${snap.jobId}`, `Session: ${snap.sessionId ?? ''}`, `Status: ${snap.status}`];
-      if (snap.error) lines.push(`Error: ${JSON.stringify(snap.error)}`);
-      if (snap.text) lines.push(snap.text);
-      return toolResult(lines.join('\n'), snap.status === 'failed', snap);
-    } catch (e) {
-      return { ...toolError(e), structuredContent: { jobId: a.jobId, status: 'unknown' } };
-    }
-  });
+  };
+  const jobUpdateDesc = 'Answer a job\'s pending question/permission inputs. Pass the input id, kind, and (for questions) the array of answers, or (for permissions) a reply of once/always/reject.';
+  R('opencode_job_input', jobUpdateDesc, jobUpdateSchema, jobUpdateFn);
+  R('opencode_job_update', jobUpdateDesc, jobUpdateSchema, jobUpdateFn);
 
   // ─── Quick status dashboard ────────────────────────────────────────
   R('opencode_status', 'Get a quick status dashboard: server health, provider count, session count, and VCS info.', {
