@@ -1,8 +1,11 @@
 /**
  * Tool group: project (upstream src/tools/project.ts, 3 tools)
- * 2.x routes (live-verified on 2.0.30):
- *   GET /api/project             200 (list)
- *   GET /api/project/current     NO route on 2.0.30 -> honest stub
+ * 2.x routes (live-verified on 2.0.31):
+ *   GET /api/project             200 — a BARE ARRAY of
+ *                                 {id, canonical, vcs, time, sandboxes}.
+ *                                 The path lives in `canonical`; 1.x called
+ *                                 it `worktree` (both are accepted here).
+ *   GET /api/project/current     NO route on 2.x -> honest stub
  * `opencode_project_init` operates on the local filesystem of the MCP host
  * (creates the directory) and then pings the server — kept for parity.
  */
@@ -34,12 +37,24 @@ function isForbiddenRoot(p) {
   });
 }
 
+/**
+ * 2.x project rows are `{id, canonical, vcs, time, sandboxes}` — the path
+ * lives in `canonical` (1.x called it `worktree`). Accept both.
+ */
+function projectPath(p) {
+  if (!p || typeof p !== 'object') return null;
+  for (const k of ['canonical', 'worktree', 'path', 'directory']) {
+    if (typeof p[k] === 'string' && p[k]) return p[k];
+  }
+  return null;
+}
+
 function formatProject(p) {
-  const worktree = (p && p.worktree) || 'unknown';
+  const worktree = projectPath(p) || 'unknown';
   const name = (worktree !== 'unknown' ? worktree.split('/').filter(Boolean).pop() : undefined)
     || (p && (p.name ?? p.id)) || 'unknown';
   const lines = [`Name: ${name}`, `Path: ${worktree}`];
-  if (p && p.vcs) lines.push(`VCS: ${p.vcs}`);
+  if (p && p.vcs) lines.push(`VCS: ${typeof p.vcs === 'object' ? (p.vcs.type ?? JSON.stringify(p.vcs)) : p.vcs}`);
   if (p && p.id) lines.push(`ID: ${p.id}`);
   return lines.join('\n');
 }
@@ -56,9 +71,11 @@ function register(registry, ctx) {
       const projects = Array.isArray(raw) ? raw : (raw?.data || []);
       if (!projects.length) return toolResult('No projects found.');
       const lines = projects.map((p) => {
-        const worktree = p.worktree ?? '?';
-        const name = (worktree !== '?' ? worktree.split('/').filter(Boolean).pop() : undefined) ?? p.name ?? p.id ?? '(root)';
-        return `- ${name}: ${worktree}${p.vcs ? ` [${p.vcs}]` : ''}`;
+        // 2.x returns a bare array of {id, canonical, vcs, ...}
+        const path = projectPath(p) ?? '(unknown path)';
+        const name = path.split('/').filter(Boolean).pop() ?? p.name ?? p.id ?? '(root)';
+        const vcs = p.vcs ? ` [${typeof p.vcs === 'object' ? (p.vcs.type ?? 'git') : p.vcs}]` : '';
+        return `- ${name}: ${path}${vcs}`;
       });
       return toolResult(`## Projects (${projects.length})\n${lines.join('\n')}`, false, { data: projects });
     } catch (e) { return toolError(e); }
@@ -97,7 +114,7 @@ function register(registry, ctx) {
     } catch (e) {
       return toolResult(
         `opencode_project_current: /api/project/current is not available on this OpenCode server (2.x build). ` +
-        `Use \`opencode_project_list\` to see all projects.`,
+        `Use \`opencode_project_list\` to see all projects, or \`opencode_context\` for the active one.`,
         true,
       );
     }

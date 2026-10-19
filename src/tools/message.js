@@ -67,7 +67,7 @@ function register(registry, ctx) {
     required: ['sessionId', 'text'],
   }, async (a) => {
     try {
-      // 2.0.30 /prompt is fire-and-forget, so a send-and-wait must dispatch
+      // 2.0.31 /prompt is fire-and-forget, so a send-and-wait must dispatch
       // AND observe via the JobService to actually return the assistant reply.
       const opts = modelOpts(a) || {};
       const started = await jobs.start(
@@ -90,7 +90,7 @@ function register(registry, ctx) {
     } catch (e) { return toolError(e); }
   });
 
-  R('opencode_message_send_async', 'Send a prompt asynchronously and return its messageId for opencode_wait. NOTE: 2.0.30 lacks /prompt_async; this falls back to a synchronous /prompt call which may block until the model replies.', {
+  R('opencode_message_send_async', 'Send a prompt asynchronously and return its messageId for opencode_wait. NOTE: 2.0.31 lacks /prompt_async; this falls back to a synchronous /prompt call which may block until the model replies.', {
     type: 'object',
     properties: {
       sessionId: { type: 'string' }, text: { type: 'string' },
@@ -103,7 +103,7 @@ function register(registry, ctx) {
     const messageId = createMessageId();
     try {
       // 2.x /prompt contract: top-level `text`. The client-coined messageID is
-      // kept for correlation but 2.0.30 returns its own server-side id, so the
+      // kept for correlation but 2.0.31 returns its own server-side id, so the
       // wait path falls back to the session's latest turn.
       const body = { text: a.text, messageID: messageId };
       Object.assign(body, modelFromBody(a));
@@ -113,7 +113,7 @@ function register(registry, ctx) {
         sent = true;
       } catch {
         // Fall back to sync prompt when /prompt_async is not available.
-        // On 2.0.30 /prompt is itself fire-and-forget (returns immediately).
+        // On 2.0.31 /prompt is itself fire-and-forget (returns immediately).
         await client.post(`/api/session/${encodeURIComponent(a.sessionId)}/prompt`, body, req(a));
       }
       return toolResult(

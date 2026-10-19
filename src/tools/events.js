@@ -1,7 +1,7 @@
 /**
  * Tool group: events (upstream src/tools/events.ts, 1 tool)
  * 2.x routes: /api/event (project-scope) and /global/event (global) are both
- * SSE streams on 2.0.30 (verified: /api/event => 200 text/event-stream).
+ * SSE streams on 2.0.31 (verified: /api/event => 200 text/event-stream).
  * We poll within a bounded window and collect up to maxEvents.
  */
 'use strict';

@@ -186,7 +186,7 @@ Example for a client that reads `mcpServers`:
 }
 ```
 
-## Routes pinned (live-verified on OpenCode 2.0.30)
+## Routes pinned (live-verified on OpenCode 2.0.31)
 
 Live 200 endpoints used by real tools:
 `/api/session`, `/api/session/{id}`, `/api/session/{id}/message`,
@@ -194,16 +194,45 @@ Live 200 endpoints used by real tools:
 `/api/agent`, `/api/command`, `/api/config`, `/api/vcs`, `/api/vcs/status`,
 `/api/provider`, `/api/model`, `/api/project`, `/api/skill`, `/api/mcp`,
 `/api/integration`, `/api/reference`, `/api/pty`, `/api/event`,
+`/api/fs/list`, `/api/fs/find`, `/api/info`,
 `/global/health`, `/global/event`.
 
-Honest no-route fallbacks (1.x-only, 404 on 2.0.30):
-`/api/fs/find` → `opencode_find_text|file|symbol`;
+Response shapes worth knowing (all verified against 2.0.31):
+- **Bare arrays** (no `{data}` envelope): `/api/session`, `/api/project`,
+  `/api/config`. `src/http.js` unwraps `.data` only for non-array objects, so
+  the array is passed through unchanged — callers must do their own
+  `Array.isArray` check.
+- **Nested object where 1.x had a scalar**: `/api/vcs` returns
+  `{"branch":{}}` outside a git worktree, and `/api/mcp` returns
+  `{"status":{"status":"connected"}}`. `helpers.js:displayScalar()` is the
+  one place that turns such values into text (or `null`).
+- **Field renames**: project rows use `canonical`, not `worktree`; provider
+  rows have `activation`/`methods`/`connections`, not `env`/`configured`.
+- `/global/health` returns the SPA HTML on 2.x — the version lives in
+  `/api/info`. `opencode_health` falls back automatically; so do
+  `opencode_setup` and `opencode_status`.
+
+Honest no-route fallbacks (1.x-only, 404 on 2.0.31):
 `/api/question`, `/api/permission` → `opencode_question_*`, `opencode_job_input`;
 `/api/provider/auth`, `/api/provider/{id}/oauth/*`, `/api/auth/{id}`;
 `/api/tui/*` → `opencode_tui_*`;
 `/api/path`, `/api/lsp`, `/api/formatter`, `/api/log`,
 `/api/instance/dispose`, `/api/project/current`,
-`/api/session/{id}/abort|todo|status|share|summarize|revert|unrevert|children`.
+`/api/session/{id}/abort|todo|share|summarize|revert|unrevert|children`.
+
+Semi-available (not a clean 404, but not usable either):
+- `/api/session/status` — GET answers `400 InvalidRequestError`
+  ("Expected a string starting with \"ses\"") and POST answers 404.
+  `opencode_session_status` derives the same view from `/api/session`
+  rows (`outcome` absent ⇒ still running).
+- `/api/fs/find?query=` — 200, honours `query`, `type` and `limit`, but
+  ignores `offset`, `directory` and `searchDirectory` (the search always
+  covers the whole project root). Backs `opencode_find_text|file|symbol`.
+- `/api/event` — SSE long connection, so it never "returns" on its own;
+  `opencode_events_poll` reads it within a bounded window.
+- `/api/provider/auth` — 404 whose body is `ProviderNotFoundError`
+  (`providerID: "auth"`), which is easy to mistake for a real provider
+  lookup failure.
 
 ## Run the smoke test
 

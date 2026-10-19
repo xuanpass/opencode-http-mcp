@@ -3,7 +3,7 @@
  * Upstream exposes: question_list / question_reply / question_reject +
  * job_get / job_cancel / job_list / job_input.
  *
- * 2.x reality on 2.0.30:
+ * 2.x reality on 2.0.31:
  *   - /api/question and /api/permission are BOTH 404 -> the question_* and
  *     job_input "pending input" surface has no server route; report honestly.
  *   - Job observation works through our JobService (session-turn model):

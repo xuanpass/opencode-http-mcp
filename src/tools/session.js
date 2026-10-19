@@ -1,9 +1,14 @@
 /**
  * Tool group: session (upstream src/tools/session.ts, 20 tools)
- * All routes pinned to the live-verified 2.x /api/... table.
+ * All routes pinned to the live-verified 2.0.31 /api/... table.
+ *
+ * Shape notes (2.0.31): /api/session answers a BARE ARRAY of rows whose
+ * `outcome` field ("succeeded" | "interrupted" | "failed") is absent while a
+ * run is in flight — that is what opencode_session_status reports, since
+ * /api/session/status itself is unusable (GET 400, POST 404).
  */
 'use strict';
-const { toolResult, toolError, formatSessionList, formatDiffResponse, resolveSessionStatus, directoryParam } = require('../helpers.js');
+const { toolResult, toolError, formatSessionList, formatDiffResponse, directoryParam } = require('../helpers.js');
 const { dir, req } = require('../util.js');
 
 function formatSession(raw) {
@@ -102,12 +107,25 @@ function register(registry, ctx) {
     type: 'object', properties: { directory: directoryParam },
   }, async (a) => {
     try {
-      const raw = await client.get('/api/session/status', undefined, dir(a));
-      const statuses = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-      const entries = Object.entries(statuses);
-      if (!entries.length) return toolResult('All sessions idle.', false, { data: statuses });
-      const lines = entries.map(([id, s]) => `- ${id}: ${resolveSessionStatus(s)}`);
-      return toolResult(`## Session Status (${entries.length})\n${lines.join('\n')}`, false, { data: statuses });
+      // 2.x removed /api/session/status (GET 400 InvalidRequestError, POST 404).
+      // The same information is on each /api/session row as `outcome`
+      // ("succeeded" | "interrupted" | "failed"); it is absent while a run
+      // is in flight or when the session never started one.
+      const raw = await client.get('/api/session', undefined, dir(a));
+      const arr = Array.isArray(raw) ? raw : (raw?.data || []);
+      if (!arr.length) return toolResult('No sessions found.');
+      const running = arr.filter((s) => !s.outcome);
+      const done = arr.filter((s) => s.outcome);
+      const lines = [];
+      if (running.length) {
+        lines.push(`**No recorded outcome (${running.length}) — running or never started:**`);
+        for (const s of running) lines.push(`- ${s.id}: ${s.time?.idle ? 'idle' : 'unknown'}`);
+      }
+      if (done.length) {
+        lines.push(`\n**Finished (${done.length}):**`);
+        for (const s of done.slice(0, 50)) lines.push(`- ${s.id}: ${s.outcome}`);
+      }
+      return toolResult(`## Session Status (${arr.length} total)\n${lines.join('\n')}`, false, { data: { running: running.length, total: arr.length } });
     } catch (e) { return toolError(e); }
   });
 

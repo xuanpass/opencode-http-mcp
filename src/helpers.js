@@ -208,6 +208,31 @@ function formatDiffResponse(diffs) {
   }).join('\n\n');
 }
 
+// ── 2.x shape normalizers (live-verified on 2.0.31) ───────────────────
+
+/**
+ * Render a value that MIGHT be a plain scalar (branch name, sha, status
+ * string) but that 2.x returns as an object (e.g. /api/vcs gives
+ * `{"branch":{}}` when the project is not a git worktree). Interpolating
+ * such a field directly yields the useless "[object Object]".
+ * @returns a display string, or null when there is nothing to show.
+ */
+function displayScalar(v) {
+  if (v == null) return null;
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v === 'object') {
+    if (Array.isArray(v)) return v.length ? v.map(displayScalar).filter(Boolean).join(', ') : null;
+    // A 2.x object field carries its text in name/id/title/value; anything
+    // else is a container we cannot meaningfully inline.
+    for (const k of ['name', 'id', 'title', 'value', 'display']) {
+      if (typeof v[k] === 'string' && v[k]) return v[k];
+    }
+    return null;
+  }
+  return String(v);
+}
+
 // ── Redact secrets from config output ─────────────────────────────────
 function redactSecrets(obj) {
   const isSecretKey = (k) => /secret|token|api[_-]?key|password|_key|authorization/i.test(k);
@@ -222,6 +247,10 @@ function redactSecrets(obj) {
   }
   function top(o) {
     if (!o || typeof o !== 'object') return o;
+    // Arrays must stay arrays: /api/config and /api/project return bare
+    // arrays (no {data} envelope), and turning one into {0:…,1:…} makes
+    // every Object.entries-based renderer print numeric keys.
+    if (Array.isArray(o)) return o.map(walk);
     const out = {};
     for (const [k, v] of Object.entries(o)) {
       out[k] = isSecretKey(k) && typeof v === 'string' ? `***${v.slice(-4)}` : walk(v);
@@ -232,11 +261,25 @@ function redactSecrets(obj) {
 }
 
 // ── Provider helpers ────────────────────────────────────────────────
+/**
+ * Is this provider usable without further setup? 2.x's /api/provider rows
+ * do NOT carry the 1.x `configured` / `env` / `apiKey` fields — they expose
+ * `activation`, `methods` and `connections` instead (a provider whose only
+ * activation is "auto" needs no key, so counting it as "not configured"
+ * is simply wrong). Detect readiness from whichever shape we are handed.
+ */
 function isProviderConfigured(p) {
   if (!p || typeof p !== 'object') return false;
   if (p.configured === true) return true;
   if (Array.isArray(p.env) && p.env.length > 0) return true;
   if (p.apiKey || p.key || p.token) return true;
+  // 2.x: an auth connection already exists for this provider.
+  if (Array.isArray(p.connections) && p.connections.length > 0) return true;
+  // 2.x: "auto"/"builtin" providers authenticate themselves; a "manual"
+  // activation without any connection/method is the only "needs setup" case.
+  const activation = typeof p.activation === 'string' ? p.activation : null;
+  if (activation && activation !== 'manual') return true;
+  if (Array.isArray(p.methods) && p.methods.length > 0) return true;
   return false;
 }
 
@@ -257,5 +300,6 @@ module.exports = {
   formatDiffResponse,
   redactSecrets,
   isProviderConfigured,
+  displayScalar,
   waitForSnapshot,
 };

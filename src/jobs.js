@@ -1,6 +1,6 @@
 /**
  * Layer 1 — JobService (full persistent port of upstream src/jobs.ts,
- * route-adapted to a live OpenCode 2.0.30 server).
+ * route-adapted to a live OpenCode 2.0.31 server).
  *
  * A "job" is a durable *session turn*: we submit a prompt to OpenCode and
  * keep a server-side record of that turn (id, session, correlation, status,
@@ -20,7 +20,7 @@
  *   - cancel() refuses to abort a session whose newest user turn is a
  *     different (newer) turn — OpenCode's abort endpoint is session-wide.
  *
- * 2.x route adaptation — VERIFIED against a live 2.0.30 server:
+ * 2.x route adaptation — VERIFIED against a live 2.0.31 server:
  *   - POST /prompt takes a TOP-LEVEL `text` field (NOT a parts array), plus
  *     optional model/agent, and is FIRE-AND-FORGET: it returns the user
  *     message in ~0.05s while the assistant turn runs server-side.
@@ -36,7 +36,7 @@
  *   - /session/{id}/abort does NOT exist (404) — cancel degrades to
  *     status "unknown" with an honest AbortRouteUnavailable note; the turn
  *     ends on its own and a later get() confirms.
- *   - /session/status is not usable as a global map on 2.0.30 — completion
+ *   - /session/status is not usable as a global map on 2.0.31 — completion
  *     is decided purely from the message stream (assistant completed + a
  *     non-tool-call finish), which is the authoritative signal on 2.x.
  */
@@ -112,7 +112,7 @@ function normMsg(m) {
 
 /**
  * Read pending question/permission requests belonging to a session.
- * Routes are optional on 2.0.30 — a 404 means "none supported / none pending".
+ * Routes are optional on 2.0.31 — a 404 means "none supported / none pending".
  */
 async function pendingInputs(client, sessionId, directory, options) {
   const out = [];
@@ -389,7 +389,7 @@ class JobService {
   // ── public API ───────────────────────────────────────────────────────
   /**
    * Dispatch a prompt and record ownership BEFORE any remote mutation.
-   * On 2.0.30 the only dispatch route is the synchronous /prompt, which is
+   * On 2.0.31 the only dispatch route is the synchronous /prompt, which is
    * itself fire-and-forget (returns the user message immediately). An
    * optional /prompt_async is tried first for newer builds; a 404 falls
    * through to /prompt.
@@ -436,7 +436,7 @@ class JobService {
           try {
             await this.client.post(`${promptPath}_async`, body, { ...request, directory });
           } catch (asyncErr) {
-            // /prompt_async is absent on 2.0.30 → synchronous /prompt.
+            // /prompt_async is absent on 2.0.31 → synchronous /prompt.
             if (!(asyncErr instanceof OpenCodeError && asyncErr.status === 404)) throw asyncErr;
             await this.client.post(promptPath, body, { ...request, directory });
           }
@@ -475,7 +475,7 @@ class JobService {
 
   /**
    * Cancel a job. OpenCode's abort endpoint is session-wide, so refuse to
-   * abort a session whose newest user turn is NOT this job's turn. On 2.0.30
+   * abort a session whose newest user turn is NOT this job's turn. On 2.0.31
    * /abort is absent → degrade to "unknown" with an explanatory note.
    */
   async cancel(jobId, options = {}) {
@@ -494,7 +494,7 @@ class JobService {
       const newest = users.slice(-1)[0] || null;
       // When the submitted messageID IS echoed we can prove which turn owns
       // the session and refuse to abort a turn that is not this job's. When it
-      // is NOT echoed (2.0.30), we degrade to the single-turn assumption: the
+      // is NOT echoed (2.0.31), we degrade to the single-turn assumption: the
       // latest user turn is the one we dispatched, so aborting is safe.
       if (newest && job.messageId && users.some((m) => m.id === job.messageId) && newest.id !== job.messageId) {
         throw new Error('A newer turn owns this session; refusing to abort unrelated work');

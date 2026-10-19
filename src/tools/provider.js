@@ -1,9 +1,17 @@
 /**
  * Tool group: provider (upstream src/tools/provider.ts, 6 tools)
- * 2.x routes (live-verified on 2.0.30):
- *   GET  /api/provider            200
+ * 2.x routes (live-verified on 2.0.31):
+ *   GET  /api/provider            200 — rows are
+ *                                 {id, integrationID, name, activation,
+ *                                  package, settings, headers, methods,
+ *                                  connections}. There is NO `env`,
+ *                                  `apiKey` or `configured` field, so
+ *                                  isProviderConfigured() falls back to
+ *                                  activation/methods/connections.
  *   GET  /api/provider/{id}       200
- *   GET  /api/model               200
+ *   GET  /api/model               200 — rows are
+ *                                 {id, modelID, providerID, family, name,
+ *                                  capabilities, variants}
  *   GET  /api/provider/auth       404 -> honest stub
  *   POST /api/provider/{id}/oauth/*  404 -> honest stubs
  *   PUT  /api/auth/{id}           404 -> honest stub
@@ -24,6 +32,18 @@ function countModels(p) {
   return 0;
 }
 
+function providerLabel(p) {
+  const id = p.id ?? p.name ?? '?';
+  const parts = [];
+  if (p.name && p.name !== id) parts.push(p.name);
+  // 2.x rows have no per-provider model list (see /api/model instead), but
+  // they do expose how auth is obtained.
+  const methods = Array.isArray(p.methods) ? p.methods.map((m) => m?.type ?? m).filter(Boolean) : [];
+  if (methods.length) parts.push(`auth: ${methods.join(', ')}`);
+  if (typeof p.activation === 'string') parts.push(`activation: ${p.activation}`);
+  return `${id}${parts.length ? ` (${parts.join('; ')})` : ''}`;
+}
+
 function register(registry, ctx) {
   const { client } = ctx;
   const R = (name, desc, schema, fn) => registry.tool(name, desc, { inputSchema: schema, run: fn });
@@ -41,17 +61,21 @@ function register(registry, ctx) {
       if (configured.length) {
         lines.push('**Configured:**');
         for (const p of configured) {
-          const id = p.id ?? p.name ?? '?';
           const env = Array.isArray(p.env) ? ` (via ${p.env.join(', ')})` : '';
-          lines.push(`- ${id}: ${countModels(p)} model${countModels(p) !== 1 ? 's' : ''}${env}`);
+          const models = countModels(p);
+          lines.push(`- ${providerLabel(p)}${models ? ` — ${models} model${models !== 1 ? 's' : ''}` : ''}${env}`);
         }
       } else {
         lines.push('**No providers configured.** Use `opencode_auth_set` or set environment variables.');
       }
       if (unconfigured.length) {
         lines.push(`\n**Not configured:** ${unconfigured.length} more providers available`);
+        for (const p of unconfigured.slice(0, 10)) lines.push(`- ${providerLabel(p)}`);
       }
-      return toolResult(`## Providers (${configured.length} configured / ${providers.length} total)\n${lines.join('\n')}\n\nUse \`opencode_provider_models\` with a provider ID to see its models.`);
+      return toolResult(
+        `## Providers (${configured.length} configured / ${providers.length} total)\n${lines.join('\n')}\n\n` +
+        `Use \`opencode_provider_models\` with a provider ID to see its models.`,
+        false, { data: providers });
     } catch (e) { return toolError(e); }
   });
 
@@ -68,11 +92,15 @@ function register(registry, ctx) {
       // Prefer the dedicated model listing route, which returns modelIDs directly.
       const models = await client.get('/api/model', undefined, dir(a));
       const arr = Array.isArray(models) ? models : (models?.data || []);
+      // 2.x rows carry `providerID` (and often `modelID`); 1.x used `provider`.
       const forProv = arr.filter((m) => m.providerID === a.providerId || m.provider === a.providerId);
-      const pool = forProv.length ? forProv : arr;
-      if (!pool.length) {
-        return toolResult(`Provider "${a.providerId}" not found. Use \`opencode_provider_list\` to see all providers.`, true);
+      if (!forProv.length) {
+        return toolResult(
+          `No models listed for provider "${a.providerId}". ` +
+          `Use \`opencode_provider_list\` to see the providers this server reports.`,
+          true);
       }
+      const pool = forProv;
       const maxItems = a.limit === 0 ? pool.length : (a.limit ?? 30);
       const shown = pool.slice(0, maxItems);
       const lines = shown.map((m) => {
@@ -126,7 +154,7 @@ function register(registry, ctx) {
     },
     required: ['providerId', 'type', 'key'],
   }, async (a) => {
-    // /api/auth/{id} is not present on 2.0.30; still surface the intent and
+    // /api/auth/{id} is not present on 2.0.31; still surface the intent and
     // fall back to /api/provider auth if available, else report unavailable.
     try {
       const res = await client.put(`/api/auth/${encodeURIComponent(a.providerId)}`, { type: a.type, key: a.key });

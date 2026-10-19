@@ -1,6 +1,6 @@
 /**
  * Tool group: tui (upstream src/tools/tui.ts, 9 tools)
- * The 2.x server exposes no /api/tui/* routes on 2.0.30 (all 404).
+ * The 2.x server exposes no /api/tui/* routes on 2.0.31 (all 404).
  * These drive the remote TUI; since the build lacks them, each tool
  * returns an honest no-route message instead of 404.
  */

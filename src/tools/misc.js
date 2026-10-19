@@ -1,18 +1,18 @@
 /**
  * Tool group: misc (upstream src/tools/misc.ts, 12 tools)
- * 2.x routes (live-verified on 2.0.30):
- *   GET /api/vcs            200
- *   GET /api/vcs/status     200
- *   GET /api/agent          200
+ * 2.x routes (live-verified on 2.0.31):
+ *   GET /api/vcs            200 — `{"data":{"branch":{}}}` outside a worktree
+ *   GET /api/vcs/status     200 — `{"data":[]}`
+ *   GET /api/agent          200 — rows carry both id and name
  *   GET /api/command        200
- *   GET /api/mcp            200
+ *   GET /api/mcp            200 — rows carry a NESTED status object
  *   GET /api/skill          200
  *   POST /api/mcp           add (best-effort)
  *   /api/path, /api/lsp, /api/formatter, /api/experimental/tool,
- *   /api/log, /api/instance/dispose  -> NO route on 2.0.30 (404)
+ *   /api/log, /api/instance/dispose  -> NO route on 2.x (404)
  */
 'use strict';
-const { toolResult, toolJson, toolError, directoryParam } = require('../helpers.js');
+const { toolResult, toolJson, toolError, displayScalar, directoryParam } = require('../helpers.js');
 const { dir, req } = require('../util.js');
 
 function dataOr(r) {
@@ -32,12 +32,24 @@ function register(registry, ctx) {
       const v = await client.get('/api/vcs', undefined, dir(a));
       if (!v || typeof v !== 'object') return toolResult('No VCS info available.');
       const lines = [];
-      for (const k of ['branch', 'remote', 'sha', 'type']) if (v[k]) lines.push(`${k === 'sha' ? 'HEAD' : k[0].toUpperCase() + k.slice(1)}: ${v[k]}`);
+      for (const k of ['branch', 'remote', 'sha', 'type']) {
+        const val = displayScalar(v[k]);
+        if (val) lines.push(`${k === 'sha' ? 'HEAD' : k[0].toUpperCase() + k.slice(1)}: ${val}`);
+      }
       if (v.dirty !== undefined) lines.push(`Dirty: ${v.dirty}`);
       if (v.ahead !== undefined) lines.push(`Ahead: ${v.ahead}`);
       if (v.behind !== undefined) lines.push(`Behind: ${v.behind}`);
       if (!lines.length) {
-        for (const [k, val] of Object.entries(v)) lines.push(`${k}: ${typeof val === 'object' ? JSON.stringify(val) : val}`);
+        // 2.x returns {"branch":{}} for a non-worktree directory — surface
+        // that honestly instead of an empty "## VCS Info" header.
+        if (v.branch && typeof v.branch === 'object') {
+          lines.push('No git worktree at this directory (branch is empty).');
+        }
+        for (const [k, val] of Object.entries(v)) {
+          if (k === 'branch') continue;
+          const d = displayScalar(val);
+          if (d) lines.push(`${k}: ${d}`);
+        }
       }
       return toolResult(`## VCS Info\n${lines.join('\n')}`, false, { data: v });
     } catch (e) { return toolError(e); }
@@ -50,8 +62,12 @@ function register(registry, ctx) {
       const agents = dataOr(await client.get('/api/agent', undefined, dir(a)));
       if (!agents.length) return toolResult('No agents found.');
       const formatted = agents.map((ag) => {
-        const name = ag.name ?? ag.id ?? '?';
-        return `- ${name} [${ag.mode ?? '?'}]: ${ag.description ?? '(no description)'}`;
+        // 2.x carries BOTH id ("build") and name ("Build"); the id is what
+        // every other tool takes as a parameter, so lead with it.
+        const name = ag.id ?? ag.name ?? '?';
+        const label = ag.name && ag.name !== name ? ` (${ag.name})` : '';
+        const hidden = ag.hidden === true ? ' [hidden]' : '';
+        return `- ${name}${label}${hidden} [${ag.mode ?? '?'}]: ${ag.description ?? '(no description)'}`;
       }).join('\n');
       return toolResult(formatted, false, { data: agents });
     } catch (e) { return toolError(e); }
@@ -79,7 +95,15 @@ function register(registry, ctx) {
       const raw = await client.get('/api/mcp', undefined, dir(a));
       const servers = dataOr(raw);
       if (!servers.length) return toolResult('No MCP servers configured.');
-      const lines = servers.map((s) => `- ${s.name ?? s.id ?? '?'}: ${s.status ?? s.state ?? 'unknown'}`);
+      // 2.x nests the state: {"name":"mx-ds-mcp","status":{"status":"connected"}}
+      const lines = servers.map((s) => {
+        const name = s.name ?? s.id ?? '?';
+        // s.status is itself an object whose own `status` field holds the
+        // human-readable state; unwrap both layers before rendering.
+        const st = s.status && typeof s.status === 'object' ? s.status.status : s.status;
+        const state = displayScalar(st) ?? displayScalar(s.state) ?? 'unknown';
+        return `- ${name}: ${state}`;
+      });
       return toolResult(`## MCP Servers (${servers.length})\n${lines.join('\n')}`, false, { data: servers });
     } catch (e) { return toolError(e); }
   });
@@ -116,7 +140,15 @@ function register(registry, ctx) {
     try {
       const items = dataOr(await client.get('/api/integration', undefined, dir(a)));
       if (!items.length) return toolResult('No integrations found.');
-      const lines = items.map((x) => `- ${x.name ?? x.id ?? '?'}${x.status ? `: ${x.status}` : ''}`);
+      const lines = items.map((x) => {
+        const name = x.name ?? x.id ?? '?';
+        // 2.x: {"id":"302ai","methods":[{"type":"key"},{"type":"env","names":["302AI_API_KEY"]}]}
+        const methods = Array.isArray(x.methods) ? x.methods.map(displayScalar).filter(Boolean).join(', ') : '';
+        const connections = Array.isArray(x.connections) ? x.connections.length : 0;
+        const extra = [methods ? `methods: ${methods}` : '', connections ? `${connections} connection${connections === 1 ? '' : 's'}` : '']
+          .filter(Boolean).join(' · ');
+        return `- ${name}${extra ? ` (${extra})` : ''}`;
+      });
       return toolResult(`## Integrations (${items.length})\n${lines.join('\n')}`, false, { data: items });
     } catch (e) { return toolError(e); }
   });
@@ -144,7 +176,7 @@ function register(registry, ctx) {
   });
 
   // --- LSP / Formatter / experimental tools (upstream misc.ts) ---
-  // 2.0.30 has no /api/lsp, /api/formatter, /api/experimental/tool* routes;
+  // 2.0.31 has no /api/lsp, /api/formatter, /api/experimental/tool* routes;
   // register honest no-route fallbacks so the tool surface matches upstream.
 
   R('opencode_lsp_status', 'Get the status of LSP (Language Server Protocol) servers.', {

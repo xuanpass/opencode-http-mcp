@@ -1,6 +1,6 @@
 /**
  * Tool group: workflow (upstream src/tools/workflow.ts)
- * High-level composite operations. Routes pinned to live-verified 2.0.30.
+ * High-level composite operations. Routes pinned to live-verified 2.0.31.
  *
  * Durable job model (JobService, persistent): a "job" is a session turn with
  * a durable jobId. start() submits once (fire); get(jobId) observes ONCE —
@@ -8,7 +8,7 @@
  * session-observation helper (observeSession) is shared by the
  * session-based tools and the job engine.
  *
- * 2.0.30 honest degradation: /prompt_async, /session/{id}/abort and the
+ * 2.0.31 honest degradation: /prompt_async, /session/{id}/abort and the
  * /question /permission reply routes 404 — the JobService surfaces these as
  * "unknown" states with explanatory notes rather than crashing, and
  * fire-and-forget / check / wait / job_list / job_update / job_cancel all
@@ -18,8 +18,8 @@
 const {
   toolResult, toolError, formatMessageResponse, formatMessageList,
   formatSessionList, analyzeMessageResponse, formatDiffResponse,
-  resolveSessionStatus, isProviderConfigured, applyModelDefaults,
-  redactSecrets, directoryParam, waitForSnapshot,
+  isProviderConfigured, applyModelDefaults,
+  redactSecrets, displayScalar, directoryParam, waitForSnapshot,
 } = require('../helpers.js');
 const { dir, req } = require('../util.js');
 const { observeSession } = require('../jobs.js');
@@ -28,11 +28,21 @@ function providersOf(raw) {
   if (raw && typeof raw === 'object' && 'all' in raw) return raw.all;
   return raw;
 }
-function countModels(p) {
-  const m = p && p.models;
-  if (Array.isArray(m)) return m.length;
-  if (m && typeof m === 'object') return Object.keys(m).length;
-  return 0;
+/**
+ * 2.x's /global/health answers with the SPA HTML, so health.version is
+ * always missing. The real version lives in /api/info. Fetch it there.
+ */
+async function serverVersion(client, d) {
+  try {
+    const info = await client.get('/api/info', undefined, d);
+    if (info && info.version) return String(info.version);
+  } catch { /* keep null */ }
+  return null;
+}
+/** 2.x /api/vcs returns {"branch":{}} outside a worktree — never "[object Object]". */
+function vcsBranch(vcs) {
+  const b = displayScalar(vcs && vcs.branch);
+  return b || null;
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -46,10 +56,14 @@ function register(registry, ctx) {
   }, async (a) => {
     const sections = [];
     let healthy = false;
+    let version = null;
     try {
       const health = await client.get('/global/health', undefined, dir(a));
       healthy = true;
-      sections.push(`## Server\nStatus: healthy\nVersion: ${(health && health.version) ?? 'unknown'}`);
+      version = (health && typeof health === 'object' && health.version) ? String(health.version) : null;
+      // 2.x serves SPA HTML from /global/health — the version is in /api/info.
+      if (!version) version = await serverVersion(client, dir(a));
+      sections.push(`## Server\nStatus: healthy\nVersion: ${version ?? 'unknown'}`);
     } catch (e) {
       sections.push(`## Server\nStatus: UNREACHABLE\nError: ${e.message}`);
       return toolResult(sections.join('\n\n'));
@@ -62,7 +76,7 @@ function register(registry, ctx) {
         const lines = [];
         if (ready.length) {
           lines.push('**Ready to use:**');
-          for (const p of ready) lines.push(`- ${p.id}: ${countModels(p)} models`);
+          for (const p of ready) lines.push(`- ${p.id}${p.name && p.name !== p.id ? ` (${p.name})` : ''}`);
         } else {
           lines.push('**No providers configured yet.** Set an API key via env var and restart opencode.');
         }
@@ -91,7 +105,7 @@ function register(registry, ctx) {
   }, async (a) => {
     let sessionId;
     try {
-      // 2.0.30's /prompt is fire-and-forget (returns the user message, not the
+      // 2.0.31's /prompt is fire-and-forget (returns the user message, not the
       // assistant reply), so a one-shot ask must dispatch AND observe via the
       // JobService rather than treating the POST response as the answer.
       const model = applyModelDefaults(a.providerID, a.modelID);
@@ -190,24 +204,37 @@ function register(registry, ctx) {
       const sections = [];
       if (vcs) {
         const lines = [];
-        if (vcs.branch) lines.push(`Branch: ${vcs.branch}`);
-        if (vcs.remote) lines.push(`Remote: ${vcs.remote}`);
-        if (vcs.sha) lines.push(`HEAD: ${vcs.sha}`);
+        const branch = vcsBranch(vcs);
+        if (branch) lines.push(`Branch: ${branch}`);
+        const remote = displayScalar(vcs.remote);
+        if (remote) lines.push(`Remote: ${remote}`);
+        const sha = displayScalar(vcs.sha);
+        if (sha) lines.push(`HEAD: ${sha}`);
         if (vcs.dirty !== undefined) lines.push(`Dirty: ${vcs.dirty}`);
-        sections.push(`## VCS (Git)\n${lines.length ? lines.join('\n') : 'No VCS info.'}`);
+        sections.push(`## VCS (Git)\n${lines.length ? lines.join('\n') : 'No git worktree at this directory.'}`);
       }
       if (config) {
-        const c = redactSecrets(config) || {};
+        const c = redactSecrets(config);
         const top = [];
-        for (const [k, v] of Object.entries(c)) {
-          if (v && typeof v === 'object' && !Array.isArray(v)) top.push(`${k}: {${Object.keys(v).length} entries}`);
-          else if (Array.isArray(v)) top.push(`${k}: [${v.length} items]`);
-          else top.push(`${k}: ${v}`);
+        if (Array.isArray(c)) {
+          // 2.x /api/config is a bare array of {type,path,info} rows.
+          for (const row of c) {
+            if (!row || typeof row !== 'object') continue;
+            const info = row.info;
+            const n = info && typeof info === 'object' ? Object.keys(info).length : 0;
+            top.push(`- [${row.type ?? 'entry'}] ${row.path ?? '?'}${n ? ` — ${n} key${n === 1 ? '' : 's'}` : ''}`);
+          }
+        } else {
+          for (const [k, v] of Object.entries(c || {})) {
+            if (v && typeof v === 'object' && !Array.isArray(v)) top.push(`${k}: {${Object.keys(v).length} entries}`);
+            else if (Array.isArray(v)) top.push(`${k}: [${v.length} items]`);
+            else top.push(`${k}: ${v}`);
+          }
         }
         sections.push(`## Config\n${top.join('\n')}`);
       }
       if (agents && Array.isArray(agents)) {
-        sections.push(`## Agents (${agents.length})\n${agents.map((ag) => `- ${ag.name ?? ag.id ?? '?'}: ${ag.description ?? ''} [${ag.mode ?? '?'}]`).join('\n')}`);
+        sections.push(`## Agents (${agents.length})\n${agents.map((ag) => `- ${ag.id ?? ag.name ?? '?'}${ag.name && ag.name !== ag.id ? ` (${ag.name})` : ''}: ${ag.description ?? ''} [${ag.mode ?? '?'}]`).join('\n')}`);
       }
       return toolResult(sections.join('\n\n') || 'No context available.');
     } catch (e) { return toolError(e); }
@@ -290,12 +317,20 @@ function register(registry, ctx) {
     try {
       let modelID = a.modelID;
       if (!modelID) {
+        // 2.x keeps the model catalogue in /api/model, not on the provider
+        // row — resolve the first model for this provider from there.
         const raw = await client.get('/api/provider', undefined, dir(a));
         const providers = providersOf(raw);
         const prov = Array.isArray(providers) ? providers.find((p) => p.id === a.providerId) : null;
-        modelID = prov && prov.models
-          ? (Array.isArray(prov.models) ? prov.models[0]?.id : Object.keys(prov.models)[0])
-          : null;
+        if (prov && prov.models) {
+          modelID = Array.isArray(prov.models) ? prov.models[0]?.id : Object.keys(prov.models)[0];
+        }
+        if (!modelID) {
+          const models = await client.get('/api/model', undefined, dir(a)).catch(() => null);
+          const arr = Array.isArray(models) ? models : (models?.data || []);
+          const first = arr.find((m) => m.providerID === a.providerId);
+          if (first) modelID = first.modelID ?? first.id;
+        }
         if (!modelID) throw new Error(`No model discovered for provider "${a.providerId}". Specify modelID.`);
       }
       // Fire-and-forget /prompt → observe via the JobService (we must not
@@ -488,15 +523,21 @@ function register(registry, ctx) {
     try {
       const d = dir(a);
       let healthOk = false;
-      let health = null;
-      try { health = await client.get('/global/health', undefined, d); healthOk = true; } catch { healthOk = false; }
+      let version = null;
+      try {
+        const health = await client.get('/global/health', undefined, d);
+        healthOk = true;
+        version = (health && typeof health === 'object' && health.version) ? String(health.version) : null;
+      } catch { healthOk = false; }
+      // 2.x serves SPA HTML from /global/health — the version is in /api/info.
+      if (healthOk && !version) version = await serverVersion(client, d);
       const [providerRaw, sessions, vcs] = await Promise.all([
         client.get('/api/provider', undefined, d).catch(() => null),
         client.get('/api/session', undefined, d).catch(() => null),
         client.get('/api/vcs', undefined, d).catch(() => null),
       ]);
       const lines = [];
-      if (healthOk) lines.push(`Server: healthy (v${(health && health.version) ?? '?'})`);
+      if (healthOk) lines.push(`Server: healthy${version ? ` (v${version})` : ''}`);
       else lines.push('Server: UNREACHABLE');
       if (providerRaw) {
         const providers = providersOf(providerRaw);
@@ -510,7 +551,7 @@ function register(registry, ctx) {
         lines.push(`Sessions: ${arr.length}`);
       }
       if (vcs) {
-        const branch = vcs.branch ?? 'unknown';
+        const branch = vcsBranch(vcs) ?? 'unknown';
         const dirty = vcs.dirty === true ? ' (dirty)' : vcs.dirty === false ? ' (clean)' : '';
         lines.push(`Branch: ${branch}${dirty}`);
       }
