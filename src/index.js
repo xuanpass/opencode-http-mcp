@@ -269,7 +269,11 @@ async function main() {
           const lines = [`Job: ${snap.jobId}`, `Session: ${snap.sessionId ?? ''}`, `Status: ${snap.status}`];
           if (snap.error) lines.push(`Error: ${JSON.stringify(snap.error)}`);
           if (snap.text) lines.push(snap.text);
-          send(id, lines.join('\n'), snap.status === 'failed', snap);
+          send(id, {
+            content: [{ type: 'text', text: lines.join('\n') }],
+            isError: snap.status === 'failed',
+            _snapshot: snap,
+          });
         } catch (e) {
           sendError(id, -32603, e instanceof Error ? e.message : String(e));
         }
@@ -329,10 +333,10 @@ async function main() {
   });
 }
 
-// Run the main function and handle any uncaught exceptions
+// Run the main function and handle any uncaught exceptions.
+// NOTE: main() must be invoked exactly ONCE — it creates a readline interface
+// on stdin; a second invocation would double-handle every JSON-RPC request.
 main().catch(err => {
   console.error('[opencode-http-mcp] Fatal error in main():', err);
   process.exit(1);
 });
-
-main();

@@ -16,8 +16,16 @@ function register(registry, ctx) {
         // 2.x may return JSON { healthy, version } or an SPA HTML fallback
         // (200 but not parseable). Treat a 200 response as "reachable".
         const status = (raw && typeof raw === 'object' && raw.healthy === false) ? 'unhealthy' : 'reachable';
-        const version = (raw && raw.version) ? String(raw.version) : 'unknown';
-        return toolResult(`Status: ${status}\nVersion: ${version}`, false, { data: raw });
+        let version = (raw && raw.version) ? String(raw.version) : null;
+        // 2.x has no version in /global/health (SPA HTML fallback) — the real
+        // version lives in /api/info ({"version":"2.0.32",...}).
+        if (!version) {
+          try {
+            const info = await client.get('/api/info', undefined, dir(a));
+            if (info && info.version) version = String(info.version);
+          } catch { /* keep unknown */ }
+        }
+        return toolResult(`Status: ${status}\nVersion: ${version || 'unknown'}`, false, { data: raw });
       } catch (e) { return toolError(e); }
     },
   });
